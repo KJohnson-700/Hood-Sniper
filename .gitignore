@@ -1,0 +1,19 @@
+# --- secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*_secret*
+*private_key*
+
+# --- generated data: large, regenerable, and may embed wallet addresses ---
+data/
+logs/
+*.log
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
