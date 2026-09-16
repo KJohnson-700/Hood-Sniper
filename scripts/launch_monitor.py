@@ -654,6 +654,45 @@ def enrich_curve(curve, block, reg, c2d, stake_usd, head=None, pre_grad=False):
                 o["flags"].append(f"FLAT-CLIPS {100*share:.0f}%")  # 0.06x
         # ----------------------------------------------------------------------
 
+        # --- DIRTY-BUYERS -----------------------------------------------------
+        # Share of the EARLIEST buyers that sit in the bad-wallet index. Uses
+        # `firsts`, which already holds each wallet's first-buy block, so the
+        # ordering is real rather than log order.
+        # TIMING LIMITATION, MEASURED -- READ BEFORE TRUSTING THIS FLAG.
+        # enrich_curve runs the moment a curve is discovered, when it has 0-1 buyers
+        # (live rows: p50=0, p90=1). The validated statistic needs >=3 SCORED wallets
+        # among the first 20 buyers, so at enrich time it almost never computes:
+        # 0 of 2,995 live rows over a six-minute run.
+        #
+        # The buyers do arrive -- rescanning those same curves minutes later finds
+        # 5-41 buyers with 4 of them in the index -- but the row is enriched once and
+        # then left alone, so the flag is evaluated against an empty crowd and stays
+        # silent. It fires on re-vet [R], which rescans, and on the minority of
+        # curves already trading when first seen.
+        #
+        # The fix is to recompute as a curve matures rather than only at discovery;
+        # until then treat a missing bad_buyer_share as "not yet measurable", never
+        # as a clean crowd. Same root cause as the clip score: we look too early.
+        scored, bad_cut = bad_wallets()
+        if scored and firsts:
+            early = [w for w, _b in sorted(firsts.items(), key=lambda kv: kv[1])[:20]]
+            known = [w for w in early if w in scored]
+            # DENOMINATOR IS SCORED WALLETS, NOT ALL EARLY BUYERS. The validated
+            # buckets are bad/scored; dividing by every early buyer instead gives a
+            # systematically smaller ratio that matches no measured bucket.
+            #
+            # Fewer than 3 scored wallets is NO INFORMATION, not a clean bill. An
+            # unknown crowd is exactly the case this must stay silent on.
+            if len(known) >= 3:
+                share = sum(1 for w in known if scored[w] <= bad_cut) / len(known)
+                o["bad_buyer_share"] = share
+                o["n_known_buyers"] = len(known)
+                if share >= 0.35:
+                    o["flags"].append(f"DIRTY-BUYERS {100*share:.0f}%")
+                elif share < 0.15:
+                    o["good"].append("CLEAN-BUYERS")
+        # ----------------------------------------------------------------------
+
         # kill flag 1 -- exactly one exempt address (0.2% vs 2.24% base)
         if o["n_exempt"] == 1:
             o["flags"].append("SOLO-EXEMPT")
@@ -743,6 +782,30 @@ def enrich_pool(token, block, stake_usd, window=6000):
 # override for the caller's balance -- verified supported on both RH endpoints. That
 # is a transactable price, not a mid, so it already contains fees and creator tax.
 CURVE_PROBE_USD = 0.10
+
+# ---------------------------------------------------------- bad-wallet index
+# Wallets whose presence in the first buys predicts a token goes nowhere. Built by
+# scripts/bad_wallets.py and validated walk-forward on 23,557 tokens the scoring
+# never saw (share of first 20 buyers that are known-bad -> rate of reaching 2x):
+#     <15%  54.0%      35-60%  17.8%
+#     15-35% 41.8%     >60%     5.7%
+# Monotonic; a 9.5x spread. Survives controlling for token activity. See that file.
+_BAD_WALLETS = None
+
+
+def bad_wallets():
+    """
+    Lazy-load (scored, cutoff). A missing index yields ({}, 0.0) -- the flag goes
+    quiet, never crashes, and MUST NOT be read as 'no bad wallets present'.
+    """
+    global _BAD_WALLETS
+    if _BAD_WALLETS is None:
+        try:
+            import bad_wallets as _bw
+            _BAD_WALLETS = _bw.load()
+        except Exception:  # noqa: BLE001
+            _BAD_WALLETS = ({}, 0.0)
+    return _BAD_WALLETS
 
 # ---------------------------------------------------------------- curve progress
 # Every Pons curve sells the same 714,285,714 tokens before graduating (the other
