@@ -35,6 +35,17 @@ import urllib.error
 import urllib.request
 from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+
+# STACK DUMP ON DEMAND: kill -USR1 <pid> writes every thread's stack to stderr.
+# This codebase has lost hours twice to a loop that stopped producing while the
+# process stayed alive, and both times the answer came from thread stacks rather
+# than from reading code. Cheap to install, impossible to add once it is stuck.
+import faulthandler as _fh
+import signal as _sig
+try:
+    _fh.register(_sig.SIGUSR1, all_threads=True, chain=False)
+except Exception:  # noqa: BLE001
+    pass
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,17 +156,77 @@ VENUES = OrderedDict([
 
 
 # ---------------------------------------------------------------- transport
+# ---------------------------------------------------------- endpoint health
+# AN ENDPOINT CAN BE HALF-ALIVE, AND ROUND-ROBIN CANNOT SEE IT.
+# Measured 2026-09-16: robinhood-rpc.publicnode.com answered eth_blockNumber and
+# served the websocket stream normally while returning HTTP 403 to EVERY
+# eth_getLogs -- 12/12 in a burst test, against 12/12 OK on the primary.
+#
+# Blind round-robin sent half of every scan's chunks there, and _logs_chunk turns
+# a persistent failure into exponential work: retry, sleep 0.25s, then split the
+# range and recurse to depth 6, so ONE bad chunk becomes up to 64 requests. A scan
+# that costs 1.5s standalone blew past the 20s enrich timeout, and the table filled
+# with SCAN-TIMEOUT and buyers=0 while every endpoint looked "up".
+#
+# So health is tracked PER METHOD: an endpoint that is fine for eth_call and dead
+# for eth_getLogs is the case that actually happened.
+_RPC_COOLDOWN = 180.0          # seconds an endpoint sits out after repeated failure
+_RPC_TRIP = 3                  # consecutive failures before benching it
+_rpc_health = {}               # (url, method) -> [consecutive_fails, benched_until]
+_health_lock = threading.Lock()
+
+
+def _endpoint_for(method):
+    """Next endpoint not benched for this method. Never returns nothing: if every
+    endpoint is benched we use the least-recently-benched one, because refusing to
+    make the call is worse than making it to a flaky host."""
+    now = time.time()
+    with _health_lock:
+        for _ in range(len(RPCS)):
+            u = next(_rr)
+            st = _rpc_health.get((u, method))
+            if not st or st[1] <= now:
+                return u
+        return min(RPCS, key=lambda u: _rpc_health.get((u, method), [0, 0])[1])
+
+
+def _mark(url, method, ok):
+    with _health_lock:
+        st = _rpc_health.setdefault((url, method), [0, 0.0])
+        if ok:
+            st[0] = 0
+            st[1] = 0.0
+        else:
+            st[0] += 1
+            if st[0] >= _RPC_TRIP:
+                st[1] = time.time() + _RPC_COOLDOWN
+
+
+def rpc_health():
+    """Snapshot for the status line -- benched endpoints must be visible, not silent."""
+    now = time.time()
+    with _health_lock:
+        return {f"{u.split('//')[-1][:22]}:{m}": round(st[1] - now)
+                for (u, m), st in _rpc_health.items() if st[1] > now}
+
+
 def rpc(method, params, tries=3, timeout=20):
     for attempt in range(tries):
+        url = _endpoint_for(method)
         try:
             body = json.dumps({"jsonrpc": "2.0", "method": method,
                                "params": params, "id": 1}).encode()
             req = urllib.request.Request(
-                next(_rr), data=body,
+                url, data=body,
                 headers={"Content-Type": "application/json", "User-Agent": UA})
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.load(r)
+                out = json.load(r)
+            # a JSON-RPC error body is still a live host; only transport failures
+            # and 4xx/5xx count against an endpoint's health
+            _mark(url, method, True)
+            return out
         except Exception:  # noqa: BLE001
+            _mark(url, method, False)
             time.sleep(0.4 * (attempt + 1))
     return {}
 
@@ -3273,6 +3344,17 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                     # mcap / liquidity / slippage off the curve itself
                     e.update(curve_metrics(curve, self.args.stake))
                     self._mark_progress(e)
+                    # RECORD THE CROSSING HERE, not only in progress_worker.
+                    # progress_worker re-reads on a 25s cycle, so after a restart
+                    # every row sat below "heating" for a minute or more and PRIME
+                    # rendered empty -- indistinguishable from a broken filter.
+                    # Progress is already known at this point; use it.
+                    pg = e.get("curve_progress")
+                    if pg is not None:
+                        with self.lock:
+                            prevp = e.get("_prev_prog")
+                            e["_prev_prog"] = pg
+                        self._note_crossing_prog(curve, prevp, pg)
                 e["pre_grad"] = rec.get("pre_grad")
                 if e.get("slippage_pct") is None and e.get("token") and not e.get("pre_grad"):
                     e["untraded"] = pool_exists_untraded(e["token"], blk)
@@ -3399,6 +3481,37 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
 
 
 # ---------------------------------------------------------------- rendering
+def _prime_empty_why(mon):
+    """
+    An empty PRIME must say WHICH gate emptied it.
+
+    "no candidate passes" reads as a broken filter, and that ambiguity cost a real
+    debugging session: the view was working exactly as designed and simply had not
+    filled yet after a restart. Counting the rejections separates "strict" from
+    "stalled" at a glance.
+    """
+    try:
+        with mon.lock:
+            rows = list(mon.detail.values())
+    except Exception:  # noqa: BLE001
+        return "PRIME is empty"
+    if not rows:
+        return "no rows on the board yet — the feed is still warming up"
+    early = dirty = late = 0
+    for e in rows:
+        c = e.get("curve")
+        if "heating" not in (mon.crossed.get(c) or set()):
+            early += 1
+        elif not mon.is_clean(e):
+            dirty += 1
+        else:
+            late += 1
+    return (f"0 of {len(rows)} rows qualify — {early} not yet past heating, "
+            f"{dirty} carry a kill flag, {late} are LATE (past "
+            f"{CURVE_LATE_PCT:.0%} of supply sold). PRIME fills over the first "
+            f"few minutes after a restart.")
+
+
 def fmt_usd(v):
     if v is None:
         return "-"
@@ -3595,8 +3708,7 @@ def build_view(mon):
                2: "nothing passes every gate [b] checks right now",
                3: "no smart-wallet cluster is live right now",
                4: "nothing has traded in the last 5 min",
-               5: ("no candidate is both clean and past heating right now — "
-                   "PRIME shows ~4 rows/hour by design")}.get(mon.only_tradeable, "")
+               5: _prime_empty_why(mon)}.get(mon.only_tradeable, "")
         t.add_row("", "[dim]" + why + "[/]", "", "", "", "", "", "", "", "", "",
                   "", "", "", "[dim]press f to widen the filter[/]")
     panels = [Panel(t, title=hdr)]
