@@ -553,6 +553,7 @@ def enrich_curve(curve, block, reg, c2d, stake_usd, head=None, pre_grad=False):
             o["flags"].append("SCAN-TIMEOUT")
             scan.cancel()
         buys, sells, exempt, snipers, quote_in = {}, {}, set(), set(), 0
+        clips = []           # every buy's quote size, for the same-size-clip score
         # First-buy BLOCK per wallet. The trade scan already reads every buy log, so
         # this is free -- and it is the only way the flow sparkline survives a
         # restart. buy_accel used to read ONLY live-observed buys, so after every
@@ -569,7 +570,9 @@ def enrich_curve(curve, block, reg, c2d, stake_usd, head=None, pre_grad=False):
                     firsts[a] = b
                 d = lg["data"][2:]
                 if len(d) >= 128:
-                    quote_in += int(d[0:64], 16)
+                    q = int(d[0:64], 16)
+                    quote_in += q
+                    clips.append(q)
                     buys[a] = buys.get(a, 0) + int(d[64:128], 16)
             elif t0 == T_CURVE_SELL and len(lg["topics"]) > 1:
                 a = "0x" + lg["topics"][1][-40:]
@@ -591,6 +594,65 @@ def enrich_curve(curve, block, reg, c2d, stake_usd, head=None, pre_grad=False):
         o["curve_volume_usd"] = quote_in / 1e18 * ETH_USD
         o["exempt_sold"] = sum(1 for a in exempt if sells.get(a, 0) > 0)
         o["buy_firsts"] = firsts
+
+        # --- SAME-SIZE-CLIP SCORE ---------------------------------------------
+        # Share of buys arriving in near-identical sized clips. Measured on 1,132
+        # cached curve tapes against a 5.65% base graduation rate:
+        #
+        #     dup share   n     graduated   lift
+        #       <5%      136      0.00%     0.00x   <- 136 curves, ZERO graduations
+        #        5-20%   324      1.54%     0.21x
+        #       20-40%   180      3.89%     0.54x
+        #       40-60%   179     19.55%     2.70x
+        #       >60%      64     26.56%     3.66x
+        #
+        # Monotonic. NOTE THE SIGN: the published playbooks treat
+        # a high bundle share as a reject. On this venue it is the BEST cohort --
+        # a coordinated buyer is what actually walks a curve to graduation.
+        #
+        # Controlled for trade count, because dup share could merely proxy activity.
+        # It does not -- within 100-399 buys it is 1.61% vs 21.09%, and within 400+
+        # it is 3.64% vs 31.08%. The two are independent signals.
+        #
+        # This predicts REACHING GRADUATION, not profit. The same coordinated buyer
+        # dumping afterwards is consistent with 93.6% of graduated tokens falling to
+        # 0.70, so it belongs on the entry decision only.
+        # MINIMUM 15 BUYS, AND THE REASON MATTERS MORE THAN THE NUMBER.
+        # Lift by minimum, measured on the tapes (FLAT-CLIPS cohort vs base):
+        #     MIN= 8  n=566  0.45x       MIN=20  n=261  0.12x
+        #     MIN=12  n=426  0.27x       MIN=30  n=255  0.16x
+        #     MIN=15  n=334  0.14x   <- best discrimination at the lowest cost
+        #
+        # THIS FLAG CANNOT INFORM THE ENTRY DECISION. At the 9.3%-of-supply entry
+        # point the median curve has had just 3 buys (p90 = 5), so the score is not
+        # computable when the buy decision is actually made. It becomes readable
+        # only as a curve matures, which makes it a hold/monitor signal rather than
+        # an entry one. It was originally gated at 30, which never fired at all --
+        # live rows top out around 27 buyers.
+        n_clips = len(clips)
+        if n_clips >= 15:
+            # ROUND to 3 significant figures -- do NOT truncate the decimal string.
+            # str(q)[:3] buckets 10000000000000000 and 10000000000047514 together,
+            # which scored a set of 120 all-different buys as 100% duplicates. The
+            # flag would have fired on exactly the curves it is meant to exclude.
+            cc = {}
+            for q in clips:
+                e = len(str(q)) - 3
+                k = round(q, -e) if e > 0 else q
+                cc[k] = cc.get(k, 0) + 1
+            dup = sum(v for v in cc.values() if v >= 3)
+            share = dup / n_clips
+            o["clip_dup_share"] = share
+            o["n_clips"] = n_clips
+            # CLIPPED at the same 15-buy minimum: 11.04% vs a 6.38% base (1.73x,
+            # n=154). Weaker than the 2.7-3.7x seen on fully mature curves, because
+            # only the first ~45 buys are visible this early -- report the number
+            # that matches when the flag actually fires, not the flattering one.
+            if share >= 0.40 and n_clips >= 15:
+                o["good"].append(f"CLIPPED {100*share:.0f}%")     # 3.4x
+            elif share < 0.05:
+                o["flags"].append(f"FLAT-CLIPS {100*share:.0f}%")  # 0.06x
+        # ----------------------------------------------------------------------
 
         # kill flag 1 -- exactly one exempt address (0.2% vs 2.24% base)
         if o["n_exempt"] == 1:
@@ -2163,9 +2225,22 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
             e.setdefault("good", []).append(f"EARLY {prog:.0%}")
 
     def is_clean(self, e):
-        """No measured kill flag. 6.03% reach near-grad vs 0.71% flagged."""
+        """
+        No measured kill flag. 6.03% reach near-grad vs 0.71% flagged.
+
+        FLAT-CLIPS earns its place here on the cheapest terms of any gate so far.
+        Replayed over the 883 taped curves that got past the heating level:
+
+            past heating                 883 rows   64 graduations   7.25%
+            + exclude FLAT-CLIPS         740 rows   63 graduations   8.51%
+
+        It removes 16.2% of rows and costs exactly ONE graduation out of 64. A gate
+        that discards a sixth of the board for a single missed winner is close to
+        free, which is not true of the other two flags here.
+        """
         fl = e.get("flags") or []
-        return not any(f == "SOLO-EXEMPT" or f.startswith("CONCENTRATED") for f in fl)
+        return not any(f == "SOLO-EXEMPT" or f.startswith("CONCENTRATED")
+                       or f.startswith("FLAT-CLIPS") for f in fl)
 
     def is_prime(self, e):
         """
@@ -2623,6 +2698,26 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
     HEATING_ETH = 0.10          # 2.5% of the curve, ~$4.8k mcap
     NEAR_GRAD_ETH = 2.0         # 50% of the curve, ~$20k mcap
 
+    # THRESHOLDS IN TOKEN PROGRESS, NOT ETH RAISED.
+    #
+    # The ETH thresholds above are BLIND TO 37% OF THE MARKET. They were read from
+    # eth_getBalance, which is ~0 forever on a curve quoted in USDG or a tokenized
+    # equity (GOOGL / NVDA / SPY / AAPL / SPCX) because that curve holds its raise
+    # as an ERC-20. Those curves never crossed heating, never entered `crossed`,
+    # and `is_prime` requires "heating in crossed" -- so they were structurally
+    # invisible to the highest-conviction view. Proof: all 64 graduations in the
+    # 1,173-curve tape set are ETH-quoted, while 37.4% of the graduation journal is
+    # NOT ETH-quoted. Both can only be true if the detector cannot see them.
+    #
+    # sellableTokens() works on every curve regardless of quote, and token progress
+    # is the thing that actually predicts the return (pf 2.79 entering at 10% of
+    # supply sold, 1.32 at 25%, 0.77 at 40%). Converted from the ETH levels by
+    # measuring where each lands on ETH-quoted graduated curves:
+    #     0.1 ETH  -> 9.3% of supply sold
+    #     2.0 ETH  -> 75.5% of supply sold
+    HEATING_PROG = 0.093
+    NEAR_GRAD_PROG = 0.755
+
     def progress_worker(self, period=25.0):
         """
         Keep curve balances CURRENT for the near-graduation panel.
@@ -2643,9 +2738,36 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                              if e.get("pre_grad") and not e.get("graduated")]
                 for i in range(0, len(cands), 25):
                     chunk = cands[i:i + 25]
-                    res = rpc_batch([("eth_getBalance", [c, "latest"]) for c in chunk])
-                    for c, r in zip(chunk, res):
+                    # TWO reads per curve, interleaved: the ETH balance still drives
+                    # the liquidity column, but sellableTokens() is what the crossing
+                    # test uses, because it is the only one that works on a curve
+                    # quoted in something other than native ETH.
+                    calls = []
+                    for c in chunk:
+                        calls.append(("eth_getBalance", [c, "latest"]))
+                        calls.append(("eth_call", [{"to": c, "data": SEL_SELLABLE},
+                                                   "latest"]))
+                    res = rpc_batch(calls)
+                    for j, c in enumerate(chunk):
+                        r = res[2 * j] if 2 * j < len(res) else None
+                        rs = res[2 * j + 1] if 2 * j + 1 < len(res) else None
+                        sellable = call_int((rs or {}).get("result"))
+                        prog = (curve_progress({"curve_sellable": sellable})
+                                if sellable is not None else None)
                         v = (r or {}).get("result")
+                        if v:
+                            with self.lock:
+                                e0 = self.detail.get(c)
+                                if e0 is not None and prog is not None:
+                                    e0["curve_progress"] = prog
+                                    e0["curve_sellable"] = sellable
+                        if prog is not None:
+                            with self.lock:
+                                e0 = self.detail.get(c)
+                                prevp = (e0 or {}).get("_prev_prog")
+                                if e0 is not None:
+                                    e0["_prev_prog"] = prog
+                            self._note_crossing_prog(c, prevp, prog)
                         if not v:
                             continue           # unreadable is not zero
                         eth = int(v, 16) / 1e18
@@ -2670,6 +2792,43 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(period)
+
+    def _note_crossing_prog(self, curve, prev, prog):
+        """
+        Journal a threshold crossing measured in TOKEN PROGRESS.
+
+        This is the quote-agnostic twin of _note_crossing. It exists because the
+        ETH-balance version cannot see a curve quoted in USDG or a tokenized
+        equity, which is 37.4% of graduations -- those rows never entered
+        `crossed` and so could never be PRIME.
+
+        Rows are journalled with method="progress" so they stay distinguishable
+        from the ETH-measured history already in the file. Mixing them silently
+        would corrupt the forward test that is the point of the journal.
+        """
+        for name, lvl in (("heating", self.HEATING_PROG),
+                          ("near_grad", self.NEAR_GRAD_PROG)):
+            if prog < lvl or (prev is not None and prev >= lvl):
+                continue
+            with self.lock:
+                e = dict(self.detail.get(curve) or {})
+                seen = self.crossed.setdefault(curve, set())
+                if name in seen:
+                    continue
+                seen.add(name)
+            try:
+                with open(os.path.join(DATA, "grad_forward.jsonl"), "a") as f:
+                    f.write(json.dumps({
+                        "ts": time.time(), "level": name, "method": "progress",
+                        "threshold_prog": lvl, "progress": round(prog, 4),
+                        "curve": curve, "token": e.get("token"),
+                        "symbol": e.get("symbol"), "block": self.last_head,
+                        "mcap": e.get("mcap"), "n_buyers": e.get("n_buyers"),
+                        "tax_bps": e.get("tax_bps"),
+                        "n_smart": self.smart.count(curve) if self.smart else 0,
+                    }) + "\n")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _note_crossing(self, curve, prev, now_eth):
         """
