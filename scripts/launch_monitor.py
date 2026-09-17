@@ -1082,6 +1082,9 @@ class Monitor:
         self.venue_i = 0 if (args.venues or "pons") == "pons" else \
             self.venue_modes.index(args.venues) if args.venues in self.venue_modes else 1
         self.running = True
+        # 0 means "never heard from the stream", which correctly reads as silent
+        # and lets the poller take over immediately on a dead-WS start
+        self.ws_last_msg = 0.0
         # the one validated signal -- see smart_money.py for what was tested
         self.smart = SmartWatch() if SmartWatch else None
         self.autovet_q = deque()       # curves awaiting background vetting
@@ -3065,6 +3068,72 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                 self.stats["refresh_err"] = f"{type(ex).__name__}: {ex}"[:80]
             time.sleep(self.REFRESH_EVERY)
 
+    # -------------------------------------------------- websocket failover
+    WS_SILENT_AFTER = 45.0      # seconds of silence before we stop trusting the stream
+    POLL_EVERY = 6.0            # seconds between catch-up polls
+    POLL_MAX_BLOCKS = 6000      # ~10 min of chain; never replay hours on resume
+
+    def poll_worker(self):
+        """
+        Catch launches by polling when the websocket goes quiet.
+
+        THE FAILURE THIS EXISTS FOR. wss://robinhood-rpc.publicnode.com accepts an
+        eth_subscribe, returns a valid subscription id, and then delivers NOTHING.
+        Measured 2026-09-17: 0 messages in 20s where the same subscription had
+        returned 377 messages in 20s earlier the same day. There is no error and no
+        disconnect, so ws_worker sat in recv(), timed out after 90s, reconnected,
+        re-subscribed, and went back to waiting -- forever, silently.
+
+        Cost of that: new-launch detection stopped dead for 151 minutes while the
+        process looked perfectly healthy, refreshes kept flowing, and the board kept
+        rendering stale rows. Checked against chain: 13 launches in the window, 0
+        captured -- 100% missed.
+
+        It is the only WS host that works at all (the primary RPC refuses upgrade),
+        so there is nothing to fail over TO. Polling is the failover. eth_getLogs on
+        the primary endpoint is healthy, and at ~0.1s blocks a 6s poll loses nothing
+        that matters.
+
+        Runs ONLY while the stream is silent, so the normal path stays push-based
+        and buyflow is not double-counted. It hands logs to the same on_log(), so
+        there is one code path for both sources.
+        """
+        topics = [t for v in VENUES.values() if v["enabled"]
+                  for t in (v["new_topic"], v["grad_topic"]) if t]
+        topics.append(T_CURVE_BUY)
+        topics.append(T_CURVE_SELL)
+        topics.append(T_V4_INITIALIZE)
+        last = None
+        while self.running:
+            try:
+                quiet = time.time() - (self.ws_last_msg or 0)
+                if quiet < self.WS_SILENT_AFTER:
+                    time.sleep(self.POLL_EVERY)
+                    continue
+                head = head_block()
+                if not head:
+                    time.sleep(self.POLL_EVERY)
+                    continue
+                lo = max((last + 1) if last else head - 300,
+                         head - self.POLL_MAX_BLOCKS)
+                if lo > head:
+                    time.sleep(self.POLL_EVERY)
+                    continue
+                logs = get_logs({"fromBlock": hex(lo), "toBlock": hex(head),
+                                 "topics": [topics]})
+                self.stats["polled"] = self.stats.get("polled", 0) + len(logs)
+                self.stats["ws_quiet_s"] = round(quiet)
+                for lg in sorted(logs, key=lambda x: (int(x["blockNumber"], 16),
+                                                      int(x.get("logIndex", "0x0"), 16))):
+                    try:
+                        self.on_log(lg)
+                    except Exception:  # noqa: BLE001
+                        pass
+                last = head
+            except Exception as ex:  # noqa: BLE001
+                self.stats["poll_err"] = f"{type(ex).__name__}: {ex}"[:80]
+            time.sleep(self.POLL_EVERY)
+
     def _note_crossing_prog(self, curve, prev, prog):
         """
         Journal a threshold crossing measured in TOKEN PROGRESS.
@@ -3609,10 +3678,12 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                                     "params": ["logs", {"topics": [topics]}]}))
                 ws.recv()
                 ws.settimeout(90)
+                self.ws_last_msg = time.time()
                 while True:
                     msg = json.loads(ws.recv())
                     res = msg.get("params", {}).get("result")
                     if res:
+                        self.ws_last_msg = time.time()
                         self.on_log(res)
             except Exception:  # noqa: BLE001
                 time.sleep(3)   # reconnect
@@ -4308,6 +4379,7 @@ def main():
         threading.Thread(target=mon.autovet_worker, daemon=True).start()
     threading.Thread(target=mon.progress_worker, daemon=True).start()
     threading.Thread(target=mon.refresh_worker, daemon=True).start()
+    threading.Thread(target=mon.poll_worker, daemon=True).start()
     # seed off-thread: it is one scan and must not delay the first frame
     threading.Thread(target=mon.seed_pools, daemon=True).start()
     mon.seed_crossed()          # cheap, and PRIME is unusable without it
