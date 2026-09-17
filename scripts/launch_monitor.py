@@ -499,6 +499,182 @@ def curve_trade_logs(curve, block, head, pre_grad):
     return out
 
 
+def tape_metrics(o, logs):
+    """
+    Everything derived from a curve's trade tape, in ONE place.
+
+    Extracted so the rolling refresh and the first enrich cannot drift apart. They
+    previously could not share it at all, which is why every buyer-derived column
+    was frozen at discovery time: n_buyers, top1_share, the flow sparkline, the
+    clip score and the bad-buyer share were all computed once, seconds after
+    launch, and never recomputed.
+
+    Measured cost of that: on 25 sampled curves the board understated the buyer
+    count on 21 of them, median 10 buyers missed and max 79 -- one curve read 0 on
+    screen while the chain showed 79. Callers pass a freshly scanned `logs` and
+    this rewrites the derived fields in place.
+    """
+    buys, sells, exempt, snipers, quote_in = {}, {}, set(), set(), 0
+    clips = []           # every buy's quote size, for the same-size-clip score
+    # First-buy BLOCK per wallet. The trade scan already reads every buy log, so
+    # this is free -- and it is the only way the flow sparkline survives a
+    # restart. buy_accel used to read ONLY live-observed buys, so after every
+    # restart self.buyflow was empty and the flow column stayed blank until three
+    # fresh wallets happened to buy while the monitor was watching. The history
+    # was right there in these logs and was being discarded.
+    firsts = {}
+    for lg in logs:
+        t0 = lg["topics"][0]
+        if t0 == T_CURVE_BUY and len(lg["topics"]) > 1:
+            a = "0x" + lg["topics"][1][-40:]
+            b = int(lg["blockNumber"], 16)
+            if a not in firsts or b < firsts[a]:
+                firsts[a] = b
+            d = lg["data"][2:]
+            if len(d) >= 128:
+                q = int(d[0:64], 16)
+                quote_in += q
+                clips.append(q)
+                buys[a] = buys.get(a, 0) + int(d[64:128], 16)
+        elif t0 == T_CURVE_SELL and len(lg["topics"]) > 1:
+            a = "0x" + lg["topics"][1][-40:]
+            d = lg["data"][2:]
+            if len(d) >= 64:
+                sells[a] = sells.get(a, 0) + int(d[0:64], 16)
+        elif t0 == T_EXEMPTED and len(lg["topics"]) > 1:
+            exempt.add("0x" + lg["topics"][1][-40:])
+        elif t0 == T_SNIPE_CHARGED and len(lg["topics"]) > 1:
+            snipers.add("0x" + lg["topics"][1][-40:])
+    tot = sum(buys.values()) or 1
+    top = sorted(buys.values(), reverse=True)
+    o["n_buyers"] = len(buys)
+    o["n_sellers"] = len(sells)
+    o["n_exempt"] = len(exempt)
+    o["n_snipers"] = len(snipers)
+    o["top1_share"] = top[0] / tot if top else 0.0
+    o["curve_volume_eth"] = quote_in / 1e18
+    o["curve_volume_usd"] = quote_in / 1e18 * ETH_USD
+    o["exempt_sold"] = sum(1 for a in exempt if sells.get(a, 0) > 0)
+    o["buy_firsts"] = firsts
+
+    # --- SAME-SIZE-CLIP SCORE ---------------------------------------------
+    # Share of buys arriving in near-identical sized clips. Measured on 1,132
+    # cached curve tapes against a 5.65% base graduation rate:
+    #
+    #     dup share   n     graduated   lift
+    #       <5%      136      0.00%     0.00x   <- 136 curves, ZERO graduations
+    #        5-20%   324      1.54%     0.21x
+    #       20-40%   180      3.89%     0.54x
+    #       40-60%   179     19.55%     2.70x
+    #       >60%      64     26.56%     3.66x
+    #
+    # Monotonic. NOTE THE SIGN: the published playbooks treat
+    # a high bundle share as a reject. On this venue it is the BEST cohort --
+    # a coordinated buyer is what actually walks a curve to graduation.
+    #
+    # Controlled for trade count, because dup share could merely proxy activity.
+    # It does not -- within 100-399 buys it is 1.61% vs 21.09%, and within 400+
+    # it is 3.64% vs 31.08%. The two are independent signals.
+    #
+    # This predicts REACHING GRADUATION, not profit. The same coordinated buyer
+    # dumping afterwards is consistent with 93.6% of graduated tokens falling to
+    # 0.70, so it belongs on the entry decision only.
+    # MINIMUM 15 BUYS, AND THE REASON MATTERS MORE THAN THE NUMBER.
+    # Lift by minimum, measured on the tapes (FLAT-CLIPS cohort vs base):
+    #     MIN= 8  n=566  0.45x       MIN=20  n=261  0.12x
+    #     MIN=12  n=426  0.27x       MIN=30  n=255  0.16x
+    #     MIN=15  n=334  0.14x   <- best discrimination at the lowest cost
+    #
+    # THIS FLAG CANNOT INFORM THE ENTRY DECISION. At the 9.3%-of-supply entry
+    # point the median curve has had just 3 buys (p90 = 5), so the score is not
+    # computable when the buy decision is actually made. It becomes readable
+    # only as a curve matures, which makes it a hold/monitor signal rather than
+    # an entry one. It was originally gated at 30, which never fired at all --
+    # live rows top out around 27 buyers.
+    n_clips = len(clips)
+    if n_clips >= 15:
+        # ROUND to 3 significant figures -- do NOT truncate the decimal string.
+        # str(q)[:3] buckets 10000000000000000 and 10000000000047514 together,
+        # which scored a set of 120 all-different buys as 100% duplicates. The
+        # flag would have fired on exactly the curves it is meant to exclude.
+        cc = {}
+        for q in clips:
+            e = len(str(q)) - 3
+            k = round(q, -e) if e > 0 else q
+            cc[k] = cc.get(k, 0) + 1
+        dup = sum(v for v in cc.values() if v >= 3)
+        share = dup / n_clips
+        o["clip_dup_share"] = share
+        o["n_clips"] = n_clips
+        # CLIPPED at the same 15-buy minimum: 11.04% vs a 6.38% base (1.73x,
+        # n=154). Weaker than the 2.7-3.7x seen on fully mature curves, because
+        # only the first ~45 buys are visible this early -- report the number
+        # that matches when the flag actually fires, not the flattering one.
+        if share >= 0.40 and n_clips >= 15:
+            o["good"].append(f"CLIPPED {100*share:.0f}%")     # 3.4x
+        elif share < 0.05:
+            o["flags"].append(f"FLAT-CLIPS {100*share:.0f}%")  # 0.06x
+    # ----------------------------------------------------------------------
+
+    # --- DIRTY-BUYERS -----------------------------------------------------
+    # Share of the EARLIEST buyers that sit in the bad-wallet index. Uses
+    # `firsts`, which already holds each wallet's first-buy block, so the
+    # ordering is real rather than log order.
+    # TIMING LIMITATION, MEASURED -- READ BEFORE TRUSTING THIS FLAG.
+    # enrich_curve runs the moment a curve is discovered, when it has 0-1 buyers
+    # (live rows: p50=0, p90=1). The validated statistic needs >=3 SCORED wallets
+    # among the first 20 buyers, so at enrich time it almost never computes:
+    # 0 of 2,995 live rows over a six-minute run.
+    #
+    # The buyers do arrive -- rescanning those same curves minutes later finds
+    # 5-41 buyers with 4 of them in the index -- but the row is enriched once and
+    # then left alone, so the flag is evaluated against an empty crowd and stays
+    # silent. It fires on re-vet [R], which rescans, and on the minority of
+    # curves already trading when first seen.
+    #
+    # The fix is to recompute as a curve matures rather than only at discovery;
+    # until then treat a missing bad_buyer_share as "not yet measurable", never
+    # as a clean crowd. Same root cause as the clip score: we look too early.
+    scored, bad_cut = bad_wallets()
+    if scored and firsts:
+        early = [w for w, _b in sorted(firsts.items(), key=lambda kv: kv[1])[:20]]
+        known = [w for w in early if w in scored]
+        # DENOMINATOR IS SCORED WALLETS, NOT ALL EARLY BUYERS. The validated
+        # buckets are bad/scored; dividing by every early buyer instead gives a
+        # systematically smaller ratio that matches no measured bucket.
+        #
+        # Fewer than 3 scored wallets is NO INFORMATION, not a clean bill. An
+        # unknown crowd is exactly the case this must stay silent on.
+        if len(known) >= 3:
+            share = sum(1 for w in known if scored[w] <= bad_cut) / len(known)
+            o["bad_buyer_share"] = share
+            o["n_known_buyers"] = len(known)
+            if share >= 0.35:
+                o["flags"].append(f"DIRTY-BUYERS {100*share:.0f}%")
+            elif share < 0.15:
+                o["good"].append("CLEAN-BUYERS")
+    # ----------------------------------------------------------------------
+
+    # kill flag 1 -- exactly one exempt address (0.2% vs 2.24% base)
+    if o["n_exempt"] == 1:
+        o["flags"].append("SOLO-EXEMPT")
+    elif o["n_exempt"] >= 11:
+        o["good"].append(f"{o['n_exempt']} exempt")     # 11.1%, 5.0x
+
+    # kill flag 2 -- top-1 buyer holding 50-80%. Above 80% is the launch
+    # artifact (first buyer holds everything) and is NOT flagged, which the
+    # old blanket ">50%" rule got wrong: it fired hardest on brand-new curves
+    # where one buyer trivially owns 100% of one trade.
+    t1 = o["top1_share"]
+    if 0.50 <= t1 < 0.80 and o["n_buyers"] >= 3:
+        o["flags"].append(f"CONCENTRATED {100*t1:.0f}%")
+    elif t1 < 0.25 and o["n_buyers"] >= 5:
+        o["good"].append("SPREAD")                      # <25% is the best band
+    if o["n_snipers"] > 0:
+        o["flags"].append(f"SNIPED x{o['n_snipers']}")
+    if o["exempt_sold"] > 0:
+        o["flags"].append("INSIDER-SELL")
+
 def enrich_curve(curve, block, reg, c2d, stake_usd, head=None, pre_grad=False):
     """Everything the screen needs about one curve, as cheaply as possible."""
     o = {"curve": curve, "block": block, "venue": "pons", "flags": [], "good": []}
@@ -623,166 +799,7 @@ def enrich_curve(curve, block, reg, c2d, stake_usd, head=None, pre_grad=False):
             logs = []
             o["flags"].append("SCAN-TIMEOUT")
             scan.cancel()
-        buys, sells, exempt, snipers, quote_in = {}, {}, set(), set(), 0
-        clips = []           # every buy's quote size, for the same-size-clip score
-        # First-buy BLOCK per wallet. The trade scan already reads every buy log, so
-        # this is free -- and it is the only way the flow sparkline survives a
-        # restart. buy_accel used to read ONLY live-observed buys, so after every
-        # restart self.buyflow was empty and the flow column stayed blank until three
-        # fresh wallets happened to buy while the monitor was watching. The history
-        # was right there in these logs and was being discarded.
-        firsts = {}
-        for lg in logs:
-            t0 = lg["topics"][0]
-            if t0 == T_CURVE_BUY and len(lg["topics"]) > 1:
-                a = "0x" + lg["topics"][1][-40:]
-                b = int(lg["blockNumber"], 16)
-                if a not in firsts or b < firsts[a]:
-                    firsts[a] = b
-                d = lg["data"][2:]
-                if len(d) >= 128:
-                    q = int(d[0:64], 16)
-                    quote_in += q
-                    clips.append(q)
-                    buys[a] = buys.get(a, 0) + int(d[64:128], 16)
-            elif t0 == T_CURVE_SELL and len(lg["topics"]) > 1:
-                a = "0x" + lg["topics"][1][-40:]
-                d = lg["data"][2:]
-                if len(d) >= 64:
-                    sells[a] = sells.get(a, 0) + int(d[0:64], 16)
-            elif t0 == T_EXEMPTED and len(lg["topics"]) > 1:
-                exempt.add("0x" + lg["topics"][1][-40:])
-            elif t0 == T_SNIPE_CHARGED and len(lg["topics"]) > 1:
-                snipers.add("0x" + lg["topics"][1][-40:])
-        tot = sum(buys.values()) or 1
-        top = sorted(buys.values(), reverse=True)
-        o["n_buyers"] = len(buys)
-        o["n_sellers"] = len(sells)
-        o["n_exempt"] = len(exempt)
-        o["n_snipers"] = len(snipers)
-        o["top1_share"] = top[0] / tot if top else 0.0
-        o["curve_volume_eth"] = quote_in / 1e18
-        o["curve_volume_usd"] = quote_in / 1e18 * ETH_USD
-        o["exempt_sold"] = sum(1 for a in exempt if sells.get(a, 0) > 0)
-        o["buy_firsts"] = firsts
-
-        # --- SAME-SIZE-CLIP SCORE ---------------------------------------------
-        # Share of buys arriving in near-identical sized clips. Measured on 1,132
-        # cached curve tapes against a 5.65% base graduation rate:
-        #
-        #     dup share   n     graduated   lift
-        #       <5%      136      0.00%     0.00x   <- 136 curves, ZERO graduations
-        #        5-20%   324      1.54%     0.21x
-        #       20-40%   180      3.89%     0.54x
-        #       40-60%   179     19.55%     2.70x
-        #       >60%      64     26.56%     3.66x
-        #
-        # Monotonic. NOTE THE SIGN: the published playbooks treat
-        # a high bundle share as a reject. On this venue it is the BEST cohort --
-        # a coordinated buyer is what actually walks a curve to graduation.
-        #
-        # Controlled for trade count, because dup share could merely proxy activity.
-        # It does not -- within 100-399 buys it is 1.61% vs 21.09%, and within 400+
-        # it is 3.64% vs 31.08%. The two are independent signals.
-        #
-        # This predicts REACHING GRADUATION, not profit. The same coordinated buyer
-        # dumping afterwards is consistent with 93.6% of graduated tokens falling to
-        # 0.70, so it belongs on the entry decision only.
-        # MINIMUM 15 BUYS, AND THE REASON MATTERS MORE THAN THE NUMBER.
-        # Lift by minimum, measured on the tapes (FLAT-CLIPS cohort vs base):
-        #     MIN= 8  n=566  0.45x       MIN=20  n=261  0.12x
-        #     MIN=12  n=426  0.27x       MIN=30  n=255  0.16x
-        #     MIN=15  n=334  0.14x   <- best discrimination at the lowest cost
-        #
-        # THIS FLAG CANNOT INFORM THE ENTRY DECISION. At the 9.3%-of-supply entry
-        # point the median curve has had just 3 buys (p90 = 5), so the score is not
-        # computable when the buy decision is actually made. It becomes readable
-        # only as a curve matures, which makes it a hold/monitor signal rather than
-        # an entry one. It was originally gated at 30, which never fired at all --
-        # live rows top out around 27 buyers.
-        n_clips = len(clips)
-        if n_clips >= 15:
-            # ROUND to 3 significant figures -- do NOT truncate the decimal string.
-            # str(q)[:3] buckets 10000000000000000 and 10000000000047514 together,
-            # which scored a set of 120 all-different buys as 100% duplicates. The
-            # flag would have fired on exactly the curves it is meant to exclude.
-            cc = {}
-            for q in clips:
-                e = len(str(q)) - 3
-                k = round(q, -e) if e > 0 else q
-                cc[k] = cc.get(k, 0) + 1
-            dup = sum(v for v in cc.values() if v >= 3)
-            share = dup / n_clips
-            o["clip_dup_share"] = share
-            o["n_clips"] = n_clips
-            # CLIPPED at the same 15-buy minimum: 11.04% vs a 6.38% base (1.73x,
-            # n=154). Weaker than the 2.7-3.7x seen on fully mature curves, because
-            # only the first ~45 buys are visible this early -- report the number
-            # that matches when the flag actually fires, not the flattering one.
-            if share >= 0.40 and n_clips >= 15:
-                o["good"].append(f"CLIPPED {100*share:.0f}%")     # 3.4x
-            elif share < 0.05:
-                o["flags"].append(f"FLAT-CLIPS {100*share:.0f}%")  # 0.06x
-        # ----------------------------------------------------------------------
-
-        # --- DIRTY-BUYERS -----------------------------------------------------
-        # Share of the EARLIEST buyers that sit in the bad-wallet index. Uses
-        # `firsts`, which already holds each wallet's first-buy block, so the
-        # ordering is real rather than log order.
-        # TIMING LIMITATION, MEASURED -- READ BEFORE TRUSTING THIS FLAG.
-        # enrich_curve runs the moment a curve is discovered, when it has 0-1 buyers
-        # (live rows: p50=0, p90=1). The validated statistic needs >=3 SCORED wallets
-        # among the first 20 buyers, so at enrich time it almost never computes:
-        # 0 of 2,995 live rows over a six-minute run.
-        #
-        # The buyers do arrive -- rescanning those same curves minutes later finds
-        # 5-41 buyers with 4 of them in the index -- but the row is enriched once and
-        # then left alone, so the flag is evaluated against an empty crowd and stays
-        # silent. It fires on re-vet [R], which rescans, and on the minority of
-        # curves already trading when first seen.
-        #
-        # The fix is to recompute as a curve matures rather than only at discovery;
-        # until then treat a missing bad_buyer_share as "not yet measurable", never
-        # as a clean crowd. Same root cause as the clip score: we look too early.
-        scored, bad_cut = bad_wallets()
-        if scored and firsts:
-            early = [w for w, _b in sorted(firsts.items(), key=lambda kv: kv[1])[:20]]
-            known = [w for w in early if w in scored]
-            # DENOMINATOR IS SCORED WALLETS, NOT ALL EARLY BUYERS. The validated
-            # buckets are bad/scored; dividing by every early buyer instead gives a
-            # systematically smaller ratio that matches no measured bucket.
-            #
-            # Fewer than 3 scored wallets is NO INFORMATION, not a clean bill. An
-            # unknown crowd is exactly the case this must stay silent on.
-            if len(known) >= 3:
-                share = sum(1 for w in known if scored[w] <= bad_cut) / len(known)
-                o["bad_buyer_share"] = share
-                o["n_known_buyers"] = len(known)
-                if share >= 0.35:
-                    o["flags"].append(f"DIRTY-BUYERS {100*share:.0f}%")
-                elif share < 0.15:
-                    o["good"].append("CLEAN-BUYERS")
-        # ----------------------------------------------------------------------
-
-        # kill flag 1 -- exactly one exempt address (0.2% vs 2.24% base)
-        if o["n_exempt"] == 1:
-            o["flags"].append("SOLO-EXEMPT")
-        elif o["n_exempt"] >= 11:
-            o["good"].append(f"{o['n_exempt']} exempt")     # 11.1%, 5.0x
-
-        # kill flag 2 -- top-1 buyer holding 50-80%. Above 80% is the launch
-        # artifact (first buyer holds everything) and is NOT flagged, which the
-        # old blanket ">50%" rule got wrong: it fired hardest on brand-new curves
-        # where one buyer trivially owns 100% of one trade.
-        t1 = o["top1_share"]
-        if 0.50 <= t1 < 0.80 and o["n_buyers"] >= 3:
-            o["flags"].append(f"CONCENTRATED {100*t1:.0f}%")
-        elif t1 < 0.25 and o["n_buyers"] >= 5:
-            o["good"].append("SPREAD")                      # <25% is the best band
-        if o["n_snipers"] > 0:
-            o["flags"].append(f"SNIPED x{o['n_snipers']}")
-        if o["exempt_sold"] > 0:
-            o["flags"].append("INSIDER-SELL")
+        tape_metrics(o, logs)
     except Exception:  # noqa: BLE001
         pass
 
@@ -2927,6 +2944,127 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                 pass
             time.sleep(period)
 
+    # ---------------------------------------------------------- rolling refresh
+    REFRESH_EVERY = 20.0        # seconds between passes
+    REFRESH_COOLDOWN = 75.0     # min seconds before the same curve is rescanned
+    REFRESH_MAX = 6             # curves per pass -- one getLogs each, so bounded
+
+    def refresh_worker(self):
+        """
+        Re-read the trade tape of curves that are actually MOVING.
+
+        THE BUG THIS FIXES. Every buyer-derived column was frozen at discovery.
+        enrich_curve runs seconds after launch, when a curve genuinely has 0-1
+        buyers, and the row was never scanned again -- so n_buyers, top1_share,
+        the flow sparkline, the clip score and the bad-buyer share all showed the
+        state at birth forever.
+
+        Measured on 25 sampled curves: the board understated the buyer count on
+        21 of them, median 10 missed, max 79 -- one row read 0 on screen while the
+        chain showed 79 buyers. That single staleness explains four separate
+        "signals that never fire": FLOW blank on 86% of rows, CLIPPED needing 15
+        buys, DIRTY-BUYERS needing 3 scored ones, and the entry-timing gap.
+
+        BOUNDED ON PURPOSE. One getLogs per curve per pass is real cost, so this
+        refreshes only pre-graduation curves that have MOVED since the last look,
+        newest first, at most REFRESH_MAX per pass and never more often than
+        REFRESH_COOLDOWN. A curve sitting still needs no rescan -- its tape has
+        not changed.
+        """
+        while self.running:
+            try:
+                now = time.time()
+                with self.lock:
+                    cands = []
+                    for c, e in list(self.detail.items()):
+                        if e.get("graduated") or not e.get("pre_grad"):
+                            continue
+                        if now - (e.get("_refreshed") or 0) < self.REFRESH_COOLDOWN:
+                            continue
+                        # "moving" = progress advanced since the last refresh, or
+                        # never refreshed at all (the common case right after birth)
+                        moved = (e.get("_refreshed") is None
+                                 or (e.get("curve_progress") or 0)
+                                 > (e.get("_refresh_prog") or 0) + 1e-9)
+                        if moved:
+                            cands.append((e.get("block") or 0, c))
+                    cands.sort(reverse=True)          # newest first
+                    cands = [c for _b, c in cands[:self.REFRESH_MAX]]
+                head = self.last_head or head_block()
+                for c in cands:
+                    with self.lock:
+                        e = self.detail.get(c)
+                        blk = (e or {}).get("block")
+                    if not e or not blk:
+                        continue
+                    try:
+                        logs = curve_trade_logs(c, blk, head, True)
+                    except Exception:  # noqa: BLE001
+                        continue      # a failed rescan must not blank live fields
+                    if not logs:
+                        with self.lock:
+                            e["_refreshed"] = time.time()
+                        continue
+                    fresh = {"flags": [], "good": [],
+                             "total_fee_bps": e.get("total_fee_bps") or 0}
+                    try:
+                        tape_metrics(fresh, logs)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    with self.lock:
+                        # keep flags that do NOT come from the tape (fee, code,
+                        # dev history, LATE) and replace only the tape-derived ones
+                        keep_f = [f for f in (e.get("flags") or [])
+                                  if f.startswith(("FEE", "NONSTD", "SERIAL",
+                                                   "serial", "BOT-DEV", "LATE",
+                                                   "SCAN-TIMEOUT"))]
+                        keep_g = [g for g in (e.get("good") or [])
+                                  if g.startswith(("FIRST", "DEV", "LOW-FEE",
+                                                   "EARLY", "o1"))]
+                        for k, v in fresh.items():
+                            if k in ("flags", "good", "total_fee_bps"):
+                                continue
+                            e[k] = v
+                        e["flags"] = keep_f + [f for f in fresh["flags"]
+                                               if f not in keep_f]
+                        e["good"] = keep_g + [g for g in fresh["good"]
+                                              if g not in keep_g]
+                        e["_refreshed"] = time.time()
+                        e["_refresh_prog"] = e.get("curve_progress") or 0
+                        # feed the flow sparkline the first-buy times we just read
+                        fb = fresh.pop("buy_firsts", None) or {}
+                        bf = self.buyflow.setdefault(c, {})
+                        for w, b in fb.items():
+                            ts = time.time() - max(0, (head - b)) * BLOCK_TIME
+                            cur = bf.get(w)
+                            if cur is None:
+                                bf[w] = [1, 0, ts]
+                            elif ts < cur[2]:
+                                cur[2] = ts
+                    self.stats["refreshed"] = self.stats.get("refreshed", 0) + 1
+                    # JOURNAL THE REFRESHED ROW. The feed was written only at
+                    # enrich, so every record in it was a birth snapshot and the
+                    # file could never show how a curve developed -- which is the
+                    # exact question the tape work needs answered. Marked
+                    # refresh=true so a reader can tell a rescan from a discovery.
+                    try:
+                        with open(self.journal, "a") as jf:
+                            jf.write(json.dumps(
+                                {"ts": datetime.now(timezone.utc).isoformat(),
+                                 "refresh": True,
+                                 **{k: x for k, x in e.items()
+                                    if k not in ("flags", "good")
+                                    and not k.startswith("_")},
+                                 "flags": e.get("flags"),
+                                 "good": e.get("good")}) + "\n")
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as ex:  # noqa: BLE001
+                # A worker that fails silently is how this project lost a day to a
+                # frozen enrich loop. Surface it on the status line instead.
+                self.stats["refresh_err"] = f"{type(ex).__name__}: {ex}"[:80]
+            time.sleep(self.REFRESH_EVERY)
+
     def _note_crossing_prog(self, curve, prev, prog):
         """
         Journal a threshold crossing measured in TOKEN PROGRESS.
@@ -4169,6 +4307,7 @@ def main():
     if not args.no_autovet:
         threading.Thread(target=mon.autovet_worker, daemon=True).start()
     threading.Thread(target=mon.progress_worker, daemon=True).start()
+    threading.Thread(target=mon.refresh_worker, daemon=True).start()
     # seed off-thread: it is one scan and must not delay the first frame
     threading.Thread(target=mon.seed_pools, daemon=True).start()
     mon.seed_crossed()          # cheap, and PRIME is unusable without it
