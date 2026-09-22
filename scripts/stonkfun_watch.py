@@ -54,6 +54,10 @@ import stonkfun as SF  # noqa: E402
 DATA = SF.DATA
 STATE = os.path.join(DATA, "stonkfun_watch_state.json")
 SEEN = os.path.join(DATA, "stonkfun_alerts.jsonl")
+# Every token observed, not just the alerting ones. Without this the venue has no
+# live feed at all and cannot appear in a merged view next to Pons and flap.sh --
+# alerts alone are far too sparse to be a stream (355 of 57,137 rows qualify).
+FEED = os.path.join(DATA, "stonkfun_feed.jsonl")
 
 ALERT_RANK = 5           # alert on a token that is this early on its pair
 NEW_PAIR_HOURS = 48.0    # a pair first seen this recently is itself newsworthy
@@ -177,6 +181,7 @@ def run(once=False, dry=False, log=print):
             if not mint or not q or mint in alerted:
                 continue
             created = t.get("createdAt")
+            q_sym = (t.get("quote") or {}).get("symbol")
             known_first = first_seen.get(q)
             if not known_first or (created and created < known_first):
                 first_seen[q] = created
@@ -184,6 +189,20 @@ def run(once=False, dry=False, log=print):
             counts[q] += 1
             rank = counts[q]
             alerted.add(mint)
+            m = t.get("market") or {}
+            try:
+                with open(FEED, "a") as ff:
+                    ff.write(json.dumps({
+                        "ts": time.time(), "venue": "stonkfun", "chain": "solana",
+                        "symbol": t.get("symbol"), "name": t.get("name"),
+                        "mint": mint, "rank_on_pair": rank,
+                        "quote": q_sym, "category": (t.get("quote") or {}).get("categoryLabel"),
+                        "mcap": m.get("marketCapUsd"), "liq": m.get("liquidityUsd"),
+                        "vol24h": m.get("volume24hUsd"),
+                        "progress": t.get("graduationProgress"),
+                        "createdAt": created}) + "\n")
+            except Exception:  # noqa: BLE001
+                pass
             if rank <= ALERT_RANK:
                 age_h = None
                 if first_seen.get(q):

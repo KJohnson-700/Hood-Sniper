@@ -871,6 +871,22 @@ def enrich_pool(token, block, stake_usd, window=6000):
 # is a transactable price, not a mid, so it already contains fees and creator tax.
 CURVE_PROBE_USD = 0.10
 
+# ------------------------------------------------------------- volume floor
+# A DEAD CHART IS NOT A CANDIDATE. Measured on 1,405 live rows, rate of reaching
+# near-graduation by the volume actually shown on the board:
+#       <$100      n=560   2.7%     <- 40% of every row on screen
+#       $100-1k    n=342   5.0%
+#       $1k-10k    n=326  14.4%
+#       >$10k      n=177  44.6%
+# A 16.5x spread, and the largest single bucket was the worst one. The board was
+# mostly tokens nobody had traded, which is exactly what it looked like.
+#
+# $250 is chosen to cut the dead 40% while keeping half the board -- tight enough
+# to matter, loose enough that the table never empties. Tighter is available with
+# --min-vol and the header always states what is in force, because a filter that
+# silently hides rows is indistinguishable from a broken feed.
+MIN_VOL_USD = 250.0
+
 # ---------------------------------------------------------- bad-wallet index
 # Wallets whose presence in the first buys predicts a token goes nowhere. Built by
 # scripts/bad_wallets.py and validated walk-forward on 23,557 tokens the scoring
@@ -1270,6 +1286,22 @@ class Monitor:
         vm = self.venue_modes[self.venue_i]
         if vm != "all":
             r = [e for e in r if (e.get("venue") or "pons") == vm]
+        # DEAD CHARTS OUT. Applied before every other filter because a token nobody
+        # has traded is not a candidate under ANY view. Measured on 1,405 rows, the
+        # <$100 band was 40% of the board and reached near-graduation 2.7% of the
+        # time against 44.6% above $10k -- a 16.5x spread, with the worst bucket the
+        # largest one.
+        #
+        # Volume UNKNOWN is kept, not cut. It is missing for exactly the tokens
+        # worth catching: enrichment can still be running while a curve completes
+        # in 2.2 minutes, and treating "not measured yet" as "no volume" would drop
+        # the fastest runners -- the same mistake mcap-first ranking made in
+        # runners() before it was switched to tape-first.
+        mv = getattr(self.args, "min_vol", 0) or 0
+        if mv > 0:
+            r = [e for e in r
+                 if (e.get("vol_h1") or e.get("curve_volume_usd")) is None
+                 or (e.get("vol_h1") or e.get("curve_volume_usd") or 0) >= mv]
         if self.only_tradeable == 1:
             r = [e for e in r if self.tradeable_now(e)]
         elif self.only_tradeable == 2:
@@ -3769,6 +3801,10 @@ def build_view(mon):
     hdr = (f"[bold]HOOD SNIPER[/]  up {up/60:.0f}m · new {st['new']} "
            f"({rate_new:.1f}/min) · grads {st['grads']} ({rate_g:.2f}/min) · "
            f"venue {vlbl} · filter {filt} · " +
+           # state the volume floor OUT LOUD. A filter that silently removes 40% of
+           # the board reads as a dead feed, which is exactly how it was reported.
+           (f"[dim]vol>={fmt_usd(getattr(mon.args,'min_vol',0))}[/] · "
+            if getattr(mon.args, "min_vol", 0) else "[dim]vol floor off[/] · ") +
            (f"[bold green]{n_act} ACTIONABLE[/]" if n_act else "[dim]0 actionable[/]") +
            (f" · [bold red]WATCH HITS {wh}[/]" if wh else
             (f" · watching {','.join(sorted(mon.watch))}" if mon.watch else "")) +
@@ -3929,9 +3965,14 @@ def build_view(mon):
     rr = mon.runners()
     if rr:
         rt = Table(expand=True, box=None, show_header=True, header_style="bold")
+        # CONTRACT IS PRINTED IN FULL, and it is the reason this panel is usable.
+        # It previously had no contract column at all, so a runner could be spotted
+        # and then not acted on -- the panel showed a ticker and nothing you could
+        # paste anywhere. A truncated address is the same as no address.
         for c, j in (("symbol", "left"), ("mcap", "right"), ("move", "right"),
                      ("net 5m", "right"), ("buy side", "right"),
-                     ("wallets", "right"), ("trades", "right"), ("smart", "right")):
+                     ("wallets", "right"), ("trades", "right"), ("smart", "right"),
+                     ("contract", "left")):
             rt.add_column(c, justify=j, no_wrap=True)
         for r in rr:
             bs, net = r["_bshare"], r["_net"]
@@ -3955,7 +3996,8 @@ def build_view(mon):
             rt.add_row((r.get("symbol") or "?")[:12], mcs, vs,
                        f"[{nc}]+{fmt_usd(net)}[/]", f"[{bc}]{bs:.0%}[/]",
                        str(r["_w"]), str(r["_n"]),
-                       f"[bold yellow]★{ns}[/]" if ns >= 2 else (f"★{ns}" if ns else "-"))
+                       f"[bold yellow]★{ns}[/]" if ns >= 2 else (f"★{ns}" if ns else "-"),
+                       r.get("token") or r.get("curve") or "-")
         panels.append(Panel(rt, border_style="bright_magenta",
                             title=f"[bold bright_magenta]RUNNERS[/] [bold white on magenta] r [/] — on the curve, "
                                   f"{fmt_usd(mon.RUN_LO)}-{fmt_usd(mon.RUN_HI)} mcap AND moving "
@@ -3979,7 +4021,9 @@ def build_view(mon):
             pt.add_row((r.get("symbol") or "?")[:12], fmt_usd(r["_mcap"]),
                        f"[{pc}]+{r['_pct']:.0f}%[/]", f"[{bc}]{r['_buy']:.0%}[/]",
                        fmt_usd(r["_vol"]), str(r["_n"]),
-                       (r.get("token") or "")[:22] + "…")
+                       # full address, not [:22] -- a cut-off contract cannot be
+                       # pasted into a scanner or a buy, so it may as well be blank
+                       (r.get("token") or "-"))
         panels.append(Panel(pt, border_style="bright_cyan",
                             title="[bold bright_cyan]POST-GRAD RUNNERS[/] — "
                                   "$50k-$150k in the v4 pool "
@@ -4324,6 +4368,10 @@ def main():
     ap.add_argument("--stake", type=float, default=25.0, help="size used for slippage math")
     ap.add_argument("--max-slip", type=float, default=2.0, help="tradeable threshold %%")
     ap.add_argument("--rows", type=int, default=18)
+    ap.add_argument("--min-vol", type=float, default=MIN_VOL_USD,
+                    help="hide rows below this volume. 0 shows everything. "
+                         "Default 250: the <$100 band is 40%% of rows and reaches "
+                         "near-graduation 2.7%% of the time vs 44.6%% above $10k.")
     ap.add_argument("--watch", default="",
                     help="comma-separated tickers to alert on, e.g. --watch HOOJA,PEPE2. "
                          "Matches symbol() exactly or the name containing the term. "
