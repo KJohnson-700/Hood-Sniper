@@ -881,11 +881,20 @@ CURVE_PROBE_USD = 0.10
 # A 16.5x spread, and the largest single bucket was the worst one. The board was
 # mostly tokens nobody had traded, which is exactly what it looked like.
 #
-# $250 is chosen to cut the dead 40% while keeping half the board -- tight enough
-# to matter, loose enough that the table never empties. Tighter is available with
-# --min-vol and the header always states what is in force, because a filter that
-# silently hides rows is indistinguishable from a broken feed.
-MIN_VOL_USD = 250.0
+# $250 WAS TOO LOW -- roughly one small buy, and the board still read as dead.
+# Re-measured on 1,667 curves, near-graduation rate against rows kept:
+#       floor      kept   near-grad
+#       $0         100%     11.5%
+#       $250        50%     19.6%   <- previous default, barely moved the needle
+#       $2,000      29%     28.9%   <- operator's call, and the right shape
+#       $10,000     13%     41.3%
+#
+# $2,000 is the default: it roughly 2.5x's the base rate while still leaving
+# under a third of the board, so the table stays populated. Above that the gain
+# per row discarded flattens, and below it the dead charts come back.
+# --min-vol overrides, 0 disables, and the header always states what is in force,
+# because a filter that silently hides rows is indistinguishable from a dead feed.
+MIN_VOL_USD = 2000.0
 
 # ---------------------------------------------------------- bad-wallet index
 # Wallets whose presence in the first buys predicts a token goes nowhere. Built by
@@ -4370,8 +4379,8 @@ def main():
     ap.add_argument("--rows", type=int, default=18)
     ap.add_argument("--min-vol", type=float, default=MIN_VOL_USD,
                     help="hide rows below this volume. 0 shows everything. "
-                         "Default 250: the <$100 band is 40%% of rows and reaches "
-                         "near-graduation 2.7%% of the time vs 44.6%% above $10k.")
+                         "Default 2000: keeps 29%% of rows at a 28.9%% near-grad "
+                         "rate vs 11.5%% unfiltered.")
     ap.add_argument("--watch", default="",
                     help="comma-separated tickers to alert on, e.g. --watch HOOJA,PEPE2. "
                          "Matches symbol() exactly or the name containing the term. "

@@ -148,6 +148,7 @@ def build(min_picks=3, log=print):
     log(f"events {n:,} across {len(by_token):,} tokens", flush=True)
 
     picks = defaultdict(list)          # wallet -> [forward multiple]
+    last_blk = {}                      # wallet -> most recent block it traded in
     for tok, evs in by_token.items():
         if len(evs) < 10:              # untraded dust: no forward path to speak of
             continue
@@ -164,6 +165,8 @@ def build(min_picks=3, log=print):
             if fwd <= 0:
                 continue
             picks[w].append(fwd / px)
+            if blk > last_blk.get(w, 0):
+                last_blk[w] = blk
 
     out = {}
     for w, ms in picks.items():
@@ -174,7 +177,13 @@ def build(min_picks=3, log=print):
                   "median_fwd": ms_s[len(ms_s) // 2],
                   "mean_fwd": sum(ms) / len(ms),
                   "hit2x": sum(1 for m in ms if m >= 2.0) / len(ms),
-                  "hit5x": sum(1 for m in ms if m >= 5.0) / len(ms)}
+                  "hit5x": sum(1 for m in ms if m >= 5.0) / len(ms),
+                  # LAST SEEN. Without this a wallet's score is timeless and the
+                  # smart-money list rots invisibly: measured 2026-09-23, the 243
+                  # live entries had a MEDIAN 316.7 hours since their last trade,
+                  # only 1 of 243 had traded in the past 15 minutes, and the star
+                  # column was therefore empty on every row. Good wallets, dead list.
+                  "last_block": last_blk.get(w, 0)}
     json.dump(out, open(INDEX, "w"))
     log(f"scored {len(out):,} wallets with >={min_picks} picks -> {INDEX}", flush=True)
     return out

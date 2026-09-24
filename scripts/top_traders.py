@@ -84,6 +84,25 @@ MAX_PICKS = 400              # above this it is a router/bot, not a person
 TRADER_INDEX = os.path.join(DATA, "trader_index.json")
 MIN_PNL_USD = 0.0            # must not be underwater
 
+# RECENCY IS A HARD GATE, NOT A TIEBREAK.
+# The method was validated out-of-sample -- on 10,078 picks made AFTER the list was
+# built, the selected wallets hit 2x 41.7% of the time against a 22.8% base. The
+# wallets were never the problem. STALENESS was: measured 2026-09-23, the live
+# 243-wallet list had a median 316.7 HOURS since each wallet's last trade, only 24
+# of 243 had traded in 24h and 1 in 15 minutes, so nothing on the board ever got
+# starred. A fresh list would have shared just 9 of those 243.
+#
+# Memecoin traders rotate wallets constantly, so a one-time list decays fast and
+# silently.
+#
+# 48h, not 24h. Wallets clearing every gate, by idle window: 24h -> 206, 48h -> 377,
+# 72h -> 503, 7d -> 921 (before the P&L and sniper gates, which cut hardest). At 24h
+# the final export was 35 wallets, and the HOT alert needs TWO of them in the same
+# token -- with a list that small it would essentially never fire, trading one
+# silent failure for another. 48h keeps the list usable while staying two weeks
+# fresher than what it replaced. ~48h of chain at 0.101s blocks.
+MAX_IDLE_BLOCKS = 1_728_000
+
 # 5. REQUIRE P&L TO EXIST, not merely to be non-negative.
 #    Realized P&L needs a SELL, so a buy-and-hold wallet has none -- and 338 of 558
 #    survivors were unmeasured for exactly that reason, meaning the "not underwater"
@@ -197,9 +216,17 @@ def rank(min_picks=10, exclude_snipers=True, log=print):
     lags = wallet_lags(log=log) if exclude_snipers else {}
     pnl = pnl_map(log)
     out, snipers, losers, unmeasured = [], 0, 0, 0
+    head_blk = max((t.get("last_block") or 0) for t in hx.values()) if hx else 0
+    stale = 0
     for w, t in hx.items():
         n = t.get("picks") or 0
         if n < min_picks:
+            continue
+        lbk = t.get("last_block") or 0
+        # A wallet with no last_block predates this field; keep it rather than
+        # silently emptying the list on the first run after the upgrade.
+        if head_blk and lbk and (head_blk - lbk) > MAX_IDLE_BLOCKS:
+            stale += 1
             continue
         rate = t.get("hit2x") or 0.0
         hits = round(rate * n)
@@ -230,6 +257,8 @@ def rank(min_picks=10, exclude_snipers=True, log=print):
                     "median_lag": (lg or {}).get("median_lag"),
                     "first_share": (lg or {}).get("first_share"),
                     "wilson": lb, "edge": lb - BASELINE})
+    log(f"  dropped {stale:,} wallets idle >{MAX_IDLE_BLOCKS:,} blocks "
+        f"(~{MAX_IDLE_BLOCKS*0.101/3600:.0f}h)")
     # contracts last, because it costs RPC and the list is already small by here
     if out:
         contracts = is_contract([r["wallet"] for r in out], log)
