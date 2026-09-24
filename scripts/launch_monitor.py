@@ -3198,6 +3198,7 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
     WS_SILENT_AFTER = 45.0      # seconds of silence before we stop trusting the stream
     POLL_EVERY = 6.0            # seconds between catch-up polls
     POLL_MAX_BLOCKS = 6000      # ~10 min of chain; never replay hours on resume
+    RECONCILE_EVERY = 45.0      # catch-up sweep cadence while the stream is healthy
 
     def poll_worker(self):
         """
@@ -3233,15 +3234,37 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
         while self.running:
             try:
                 quiet = time.time() - (self.ws_last_msg or 0)
-                if quiet < self.WS_SILENT_AFTER:
+                # RECONCILE EVEN WHEN THE STREAM IS ALIVE.
+                #
+                # Gating this on total silence was wrong. Measured on a settled
+                # window (one that ended 10 minutes earlier, so enrichment had
+                # finished): 20 pons launches on chain, 11 captured -- 55%. The
+                # websocket was NOT the culprit; a parallel subscription saw 8 of 8
+                # launches in the same period. The loss is downstream, and a row can
+                # be evicted before it is enriched because _evict() drops the oldest
+                # row with no live tape and a just-queued launch has none yet.
+                #
+                # Rather than guess at every drop path, poll the launch topics on a
+                # slow cadence regardless of stream health and feed anything missing
+                # back through on_log(), which already dedupes on `addr not in
+                # detail`. One getLogs per cycle is cheap next to losing 45% of
+                # launches. The fast path stays push-based; this is a safety net.
+                slow = (quiet < self.WS_SILENT_AFTER)
+                if slow and (time.time() - getattr(self, "_last_reconcile", 0)
+                             < self.RECONCILE_EVERY):
                     time.sleep(self.POLL_EVERY)
                     continue
+                if slow:
+                    self._last_reconcile = time.time()
                 head = head_block()
                 if not head:
                     time.sleep(self.POLL_EVERY)
                     continue
-                lo = max((last + 1) if last else head - 300,
-                         head - self.POLL_MAX_BLOCKS)
+                # while the stream is healthy we re-sweep a fixed recent window
+                # instead of resuming from `last`, because the point is to catch
+                # what the stream delivered but the pipeline dropped
+                base = (head - 1200) if slow else ((last + 1) if last else head - 300)
+                lo = max(base, head - self.POLL_MAX_BLOCKS)
                 if lo > head:
                     time.sleep(self.POLL_EVERY)
                     continue
@@ -3255,7 +3278,8 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                         self.on_log(lg)
                     except Exception:  # noqa: BLE001
                         pass
-                last = head
+                if not slow:
+                    last = head
             except Exception as ex:  # noqa: BLE001
                 self.stats["poll_err"] = f"{type(ex).__name__}: {ex}"[:80]
             time.sleep(self.POLL_EVERY)
