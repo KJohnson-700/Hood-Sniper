@@ -913,7 +913,34 @@ MIN_VOL_USD = 2000.0
 # This only became usable once refresh_worker existed. Buyer counts used to be
 # frozen at discovery, when a curve genuinely has 0-1 buyers, so a gate on them
 # would have hidden the entire board.
-MIN_BUYERS = 10
+MIN_BUYERS = 0               # superseded by the swell gate below; kept for --min-buyers
+
+# THE SIGNAL IS A SWELL, NOT A LEVEL.
+# A static buyer floor barely filters anything -- measured on 1,155 taped curves
+# against a 5.54% base graduation rate, `buyers >= 10` keeps 1,121 of them and is
+# worth 1.03x. It is a threshold on a number that almost every curve eventually
+# crosses.
+#
+# What separates is a BURST of trades with buys outnumbering sells, measured over a
+# rolling window rather than since birth:
+#
+#     filter                          kept  precision  recall   lift
+#     static buyers>=10              1,121     5.71%    100%    1.03x
+#     trades>=50  in 3min            1,837     7.65%    100%    1.38x
+#     buys 65-75% of the window        112    17.86%   31.2%    3.22x
+#     trades>=50  AND buys>=60%        198    23.23%   71.9%    4.19x
+#     trades>=100 AND buys>=60%        126    30.95%   60.9%    5.59x
+#
+# Neither half works alone: trade count alone is 1.38x, buy share alone 3.22x,
+# together 4.19x. Note also that buy share PEAKS at 65-75% and falls above it
+# (22.5% -> 15.4%), which is what one-sided wash volume looks like -- so this is a
+# floor, not a "higher is better" score.
+#
+# 50 trades / 60% buys is the default: 4.19x while keeping 72% of everything that
+# graduates. trades>=100 is sharper (5.59x) but drops recall to 61%, and a filter
+# that strict stops being a board.
+SWELL_TRADES = 50
+SWELL_BUY_SHARE = 0.60
 
 # ---------------------------------------------------------- bad-wallet index
 # Wallets whose presence in the first buys predicts a token goes nowhere. Built by
@@ -1154,7 +1181,10 @@ class Monitor:
         self.curveflow = {}            # curve -> live pre-graduation tape
         self.hot_meta = {}             # curve -> {symbol, token} for tokens not yet in the table
         self.buyflow = {}              # curve -> {wallet: [n_buys, quote_wei, first_ts]}
-        self.sort_modes = ["time", "accel", "smart", "mcap"]
+        # SWELL FIRST, because the measured signal is a burst of trades with buys
+        # outnumbering sells (4.19x lift), not recency. "time" ranked a dead launch
+        # from 10 seconds ago above a token doing 200 trades a minute.
+        self.sort_modes = ["swell", "time", "accel", "smart", "mcap"]
         self.sort_i = 0
         self.acct = {}                 # wallet / balance / caps / realised P&L
         self.buyflow = {}              # curve -> {wallet: [count, quote_wei]}
@@ -1330,6 +1360,22 @@ class Monitor:
             r = [e for e in r
                  if (e.get("vol_h1") or e.get("curve_volume_usd")) is None
                  or (e.get("vol_h1") or e.get("curve_volume_usd") or 0) >= mv]
+        # SWELL GATE. Reads the live 5-minute tape, not the count frozen at enrich.
+        st_ = getattr(self.args, "swell_trades", 0) or 0
+        if st_ > 0:
+            sb = getattr(self.args, "swell_buys", SWELL_BUY_SHARE)
+            keep = []
+            for e in r:
+                m = self.curve_motion(e.get("curve"))
+                # no tape yet is NOT a failed swell -- a curve can complete in 2.2
+                # minutes and the window needs 4 trades before it reports at all
+                if m is None:
+                    keep.append(e)
+                    continue
+                _b, _s, bshare, ntr, _nw = m
+                if ntr >= st_ and bshare >= sb:
+                    keep.append(e)
+            r = keep
         mb = getattr(self.args, "min_buyers", 0) or 0
         if mb > 0:
             # unknown is kept for the same reason as volume: it means "not measured
@@ -1366,7 +1412,17 @@ class Monitor:
             r = [e for e in r if self.is_moving(e.get("curve"))]
         r = r[::-1]
         sm = self.sort_modes[self.sort_i]
-        if sm == "accel":
+        if sm == "swell":
+            def _sw(e):
+                m = self.curve_motion(e.get("curve"))
+                if not m:
+                    return (1, 0, 0)          # untaped rows sink below any real tape
+                _b, _s, bshare, ntr, _nw = m
+                # trade count first, buy share as the tiebreak: a 200-trade window
+                # at 61% buys is a bigger event than a 12-trade window at 90%
+                return (0, -ntr, -bshare)
+            r.sort(key=_sw)
+        elif sm == "accel":
             def _k(e):
                 a = self.buy_accel(e.get("curve"))
                 return -(a[1] - a[2]) if a else 1e9      # biggest NEW-buyer jump first
@@ -4408,6 +4464,12 @@ def main():
     ap.add_argument("--stake", type=float, default=25.0, help="size used for slippage math")
     ap.add_argument("--max-slip", type=float, default=2.0, help="tradeable threshold %%")
     ap.add_argument("--rows", type=int, default=18)
+    ap.add_argument("--swell-trades", type=int, default=SWELL_TRADES,
+                    help="rolling-window trade count required. 0 disables. "
+                         "Default 50 with --swell-buys 0.60 = 4.19x lift at 72%% "
+                         "recall; 100 gives 5.59x at 61%%.")
+    ap.add_argument("--swell-buys", type=float, default=SWELL_BUY_SHARE,
+                    help="buy share of the window required (0-1). Default 0.60.")
     ap.add_argument("--min-buyers", type=int, default=MIN_BUYERS,
                     help="hide rows with fewer distinct buyers. 0 disables. "
                          "Default 10; with the volume floor that is 34.6%% "
