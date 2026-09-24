@@ -896,6 +896,25 @@ CURVE_PROBE_USD = 0.10
 # because a filter that silently hides rows is indistinguishable from a dead feed.
 MIN_VOL_USD = 2000.0
 
+# DISTINCT BUYERS, NOT JUST DOLLARS. Volume is one number and one wallet can post
+# any volume it likes; a wallet can only be NEW once, so buyer COUNT is the part
+# that is expensive to fake. Measured on 3,321 curves (base near-grad 10.2%):
+#
+#     filter                      kept   precision   recall
+#     volume >= $2,000             895      26.4%     69.6%
+#     buyers >= 10                 734      27.8%     60.2%
+#     buyers >= 20                 425      36.9%     46.3%
+#     vol>=2k AND buyers>=10       558      34.6%     56.9%   <- this
+#
+# Buyer count alone beats the volume floor, and the two together beat either. The
+# pair was chosen over buyers>=20 (36.9% precision) because that drops recall to
+# 46% -- it would hide more than half of everything that goes on to run.
+#
+# This only became usable once refresh_worker existed. Buyer counts used to be
+# frozen at discovery, when a curve genuinely has 0-1 buyers, so a gate on them
+# would have hidden the entire board.
+MIN_BUYERS = 10
+
 # ---------------------------------------------------------- bad-wallet index
 # Wallets whose presence in the first buys predicts a token goes nowhere. Built by
 # scripts/bad_wallets.py and validated walk-forward on 23,557 tokens the scoring
@@ -1311,6 +1330,16 @@ class Monitor:
             r = [e for e in r
                  if (e.get("vol_h1") or e.get("curve_volume_usd")) is None
                  or (e.get("vol_h1") or e.get("curve_volume_usd") or 0) >= mv]
+        mb = getattr(self.args, "min_buyers", 0) or 0
+        if mb > 0:
+            # unknown is kept for the same reason as volume: it means "not measured
+            # yet", and a curve can complete in 2.2 minutes. A row that is genuinely
+            # moving is also kept regardless -- the live tape cannot lag, while the
+            # buyer count is a scan result that can.
+            r = [e for e in r
+                 if e.get("n_buyers") is None
+                 or (e.get("n_buyers") or 0) >= mb
+                 or self.is_moving(e.get("curve"))]
         if self.only_tradeable == 1:
             r = [e for e in r if self.tradeable_now(e)]
         elif self.only_tradeable == 2:
@@ -3814,6 +3843,8 @@ def build_view(mon):
            # the board reads as a dead feed, which is exactly how it was reported.
            (f"[dim]vol>={fmt_usd(getattr(mon.args,'min_vol',0))}[/] · "
             if getattr(mon.args, "min_vol", 0) else "[dim]vol floor off[/] · ") +
+           (f"[dim]buyers>={getattr(mon.args,'min_buyers',0)}[/] · "
+            if getattr(mon.args, "min_buyers", 0) else "") +
            (f"[bold green]{n_act} ACTIONABLE[/]" if n_act else "[dim]0 actionable[/]") +
            (f" · [bold red]WATCH HITS {wh}[/]" if wh else
             (f" · watching {','.join(sorted(mon.watch))}" if mon.watch else "")) +
@@ -4377,6 +4408,11 @@ def main():
     ap.add_argument("--stake", type=float, default=25.0, help="size used for slippage math")
     ap.add_argument("--max-slip", type=float, default=2.0, help="tradeable threshold %%")
     ap.add_argument("--rows", type=int, default=18)
+    ap.add_argument("--min-buyers", type=int, default=MIN_BUYERS,
+                    help="hide rows with fewer distinct buyers. 0 disables. "
+                         "Default 10; with the volume floor that is 34.6%% "
+                         "precision at 56.9%% recall vs 26.4%%/69.6%% on volume "
+                         "alone. 20 gives 36.9%% but drops recall to 46%%.")
     ap.add_argument("--min-vol", type=float, default=MIN_VOL_USD,
                     help="hide rows below this volume. 0 shows everything. "
                          "Default 2000: keeps 29%% of rows at a 28.9%% near-grad "
