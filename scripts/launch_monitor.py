@@ -3188,6 +3188,10 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                                  "good": e.get("good")}) + "\n")
                     except Exception:  # noqa: BLE001
                         pass
+                try:
+                    self.resolve_pool_symbols()
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception as ex:  # noqa: BLE001
                 # A worker that fails silently is how this project lost a day to a
                 # frozen enrich loop. Surface it on the status line instead.
@@ -3283,6 +3287,40 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
             except Exception as ex:  # noqa: BLE001
                 self.stats["poll_err"] = f"{type(ex).__name__}: {ex}"[:80]
             time.sleep(self.POLL_EVERY)
+
+    def resolve_pool_symbols(self, limit=12):
+        """
+        Fill in token names for v4 pools learned from the swap stream.
+
+        on_v4_init() stores {"token": ..., "symbol": None} because the Initialize
+        log carries the addresses and nothing else. The symbol was only ever filled
+        while enriching an ALREADY-GRADUATED token, which the code's own note says
+        usually never happens -- so the POST-GRAD RUNNERS panel rendered blank
+        names and was unusable for exactly the tokens it exists to surface.
+
+        One symbol() call per pool, once, batched and bounded. Cheap next to a
+        panel nobody can read.
+        """
+        with self.lock:
+            todo = [(pid, v) for pid, v in self.pool2tok.items()
+                    if v.get("token") and not v.get("symbol")
+                    and not v.get("_sym_failed")][:limit]
+        if not todo:
+            return
+        res = rpc_batch([("eth_call", [{"to": v["token"], "data": SEL_SYMBOL},
+                                       "latest"]) for _pid, v in todo])
+        with self.lock:
+            for (pid, _v), r in zip(todo, res):
+                sym = call_str((r or {}).get("result"))
+                row = self.pool2tok.get(pid)
+                if not row:
+                    continue
+                if sym:
+                    row["symbol"] = sym
+                else:
+                    # mark it so a token that simply has no symbol() is not retried
+                    # every pass forever -- unreadable is not the same as pending
+                    row["_sym_failed"] = True
 
     def _note_crossing_prog(self, curve, prev, prog):
         """

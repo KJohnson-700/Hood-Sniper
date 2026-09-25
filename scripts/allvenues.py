@@ -114,6 +114,50 @@ def collect(limit=40):
     return out[:limit]
 
 
+def rates(window_min=60.0):
+    """
+    Launches per hour per chain, counted from each feed over a trailing window.
+
+    THIS IS THE POINT OF THE MERGED VIEW. "Which chain has momentum" is a question
+    about RATE, and eyeballing three interleaved row lists cannot answer it -- the
+    busiest chain simply fills the screen. Counting is the only honest way to see a
+    chain speeding up or going quiet.
+
+    Counted per DISTINCT token, not per row: every feed re-writes a row when it
+    refreshes, so raw line counts measure our own polling cadence rather than the
+    market.
+    """
+    now = time.time()
+    cut = now - window_min * 60
+    out = {}
+    for src, chain, path in FEEDS:
+        if not os.path.exists(path):
+            out[src] = None
+            continue
+        try:
+            sz = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, sz - 12_000_000))
+                lines = f.read().decode("utf8", "ignore").split("\n")[1:]
+        except Exception:  # noqa: BLE001
+            out[src] = None
+            continue
+        ids, oldest = set(), None
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            n = _norm(src, chain, r)
+            if not n["ts"] or n["ts"] < cut:
+                continue
+            oldest = n["ts"] if oldest is None else min(oldest, n["ts"])
+            ids.add(n["id"] or n["symbol"])
+        span_h = max(0.05, (now - (oldest or cut)) / 3600.0)
+        out[src] = (len(ids), len(ids) / span_h, span_h)
+    return out
+
+
 def health():
     """Per-feed freshness. A stale feed is the thing you most need to see here --
     a silent collector looks identical to a quiet market on a merged screen."""
@@ -144,6 +188,16 @@ def render_plain(rows, limit):
         fl = ",".join(r["flags"])[:34]
         print(f"{t:>8} {r['chain']:>5} {r['venue']:>9} {str(r['symbol'])[:12]:>12} "
               f"{fmt_usd(r['mcap']):>8} {fmt_usd(r['liq']):>8} {r['signal'][:20]:>20} {fl}")
+    print()
+    rr = rates()
+    print(f"   {'chain':>10} {'new tokens/hr':>15} {'seen':>7} {'over':>7}")
+    for src, chain, _p in FEEDS:
+        v = rr.get(src)
+        if not v:
+            print(f"   {src:>10} {'no data':>15}")
+            continue
+        n, per_h, span = v
+        print(f"   {src:>10} {per_h:15,.0f} {n:7,d} {span:6.1f}h")
     print()
     for src, mins in health():
         state = "no feed" if mins is None else (
