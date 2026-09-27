@@ -1149,9 +1149,12 @@ class Monitor:
         self.only_tradeable = 5        # 0=all 1=tradeable 2=actionable 3=hot 4=moving 5=prime
         # Venue filter. Pons is the priority venue; Bankr/o1 are occasional, so
         # they must be dismissable without losing them entirely.
-        self.venue_modes = ["pons", "all", "bankr", "o1"]
-        self.venue_i = 0 if (args.venues or "pons") == "pons" else \
-            self.venue_modes.index(args.venues) if args.venues in self.venue_modes else 1
+        # DEFAULT TO ALL, not pons. Robinhood's own launchpad (Bankr) and Pons are
+        # both on Robinhood Chain and belong on one screen; defaulting the filter to
+        # "pons" hid every other RHC venue behind a keypress nobody knew to press.
+        self.venue_modes = ["all", "pons", "bankr", "o1"]
+        self.venue_i = (self.venue_modes.index(args.venues)
+                        if args.venues in self.venue_modes else 0)
         self.running = True
         # 0 means "never heard from the stream", which correctly reads as silent
         # and lets the poller take over immediately on a dead-WS start
@@ -2204,8 +2207,16 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
     def on_log(self, lg):
         topic = lg["topics"][0]
         if topic == T_V4_INITIALIZE:
+            # LEARN THE POOL, THEN KEEP GOING. This used to `return` here, which
+            # silently killed the Bankr venue: Bankr is Doppler infra with no
+            # factory event, so a launch is detected from exactly this log (the one
+            # whose hooks field is the Doppler hook) further down in this function.
+            # The pool-mapping hook was added later and short-circuited it, so
+            # bankr was enabled in VENUES, documented as landing "in the detail
+            # pane", and produced ZERO rows -- 3,520 pons and 8 o1 in the feed,
+            # no bankr at all.
             self.on_v4_init(lg)
-            return
+            # fall through to the Bankr check below
         if topic == T_V4_SWAP:
             self.on_v4_swap(lg)
             return

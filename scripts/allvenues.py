@@ -43,11 +43,18 @@ FEEDS = [
     ("pons", "rhc", os.path.join(DATA, "monitor_feed.jsonl")),
     ("bsc", "bsc", os.path.join(DATA, "bsc_feed.jsonl")),
     ("stonkfun", "sol", os.path.join(DATA, "stonkfun_feed.jsonl")),
+    ("pumpfun", "sol", os.path.join(DATA, "sol_feed.jsonl")),
 ]
 TAIL_BYTES = 400_000
 
 
 def _ts(r):
+    if r.get("ts_utc") and not r.get("ts"):
+        try:
+            return dt.datetime.fromisoformat(
+                str(r["ts_utc"]).replace("Z", "+00:00")).timestamp()
+        except Exception:  # noqa: BLE001
+            return None
     """Seconds since epoch from whatever shape a feed uses. None when unknown --
     never fabricate a timestamp, since ordering is the whole point of this view."""
     v = r.get("ts")
@@ -77,6 +84,27 @@ def _norm(src, chain, r):
                 "signal": ("tradeable" if r.get("tradeable") else "not tradeable"),
                 "extra": (r.get("quote") or ""),
                 "flags": (["WATCH-HIT"] if r.get("watch_hit") else [])}
+    if src == "pumpfun":
+        # kind="token" rows are the live snapshot; creates and stonk_* rows are
+        # events and would double-count the same mint
+        if r.get("kind") != "token":
+            return {"ts": None, "chain": chain, "venue": "pump.fun",
+                    "symbol": None, "id": None, "mcap": None, "liq": None,
+                    "signal": "", "extra": "", "flags": []}
+        pp = r.get("progress_pct")
+        # A mint with no symbol is still actionable -- you can paste it. A blank
+        # cell is not. Only tokens first seen at CREATE carry a name; ones
+        # discovered from a trade have none, and that is most of them.
+        mint = r.get("mint") or ""
+        return {"ts": _ts(r), "chain": chain, "venue": "pump.fun",
+                "symbol": r.get("symbol") or (mint[:10] + "…" if mint else None),
+                "id": mint,
+                "mcap": None, "liq": None,
+                # progress uses INIT/GRAD virtual-SOL constants the module itself
+                # marks as assumptions, not measured like the Pons 4.2 ETH figure
+                "signal": (f"{pp:.0f}% of curve" if pp is not None else ""),
+                "extra": f"{r.get('n_buyers')} buyers",
+                "flags": (["MOMENTUM"] if (r.get("n_buyers") or 0) >= 10 else [])}
     return {"ts": _ts(r), "chain": chain, "venue": "stonkfun",
             "symbol": r.get("symbol"), "id": r.get("mint"),
             "mcap": r.get("mcap"), "liq": r.get("liq"),

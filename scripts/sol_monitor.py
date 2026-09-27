@@ -297,6 +297,43 @@ class SolMonitor:
                                            ("buy" if is_buy else "sell")),
                        "instr": kind, "sig": v.get("signature"), "venue": "stonkfun"})
 
+    def snapshot_worker(self, period=20.0):
+        """
+        Journal the LIVE pump.fun token state on a timer.
+
+        _journal() only ever fired on a pump.fun CREATE and on StonkFun
+        launches/trades. Measured over 90s of live running: 200 trades/min across
+        57 tokens, 10 of them past 25% of the curve -- and creates 0, so not one
+        row was written. The feed file was 17 DAYS stale while the monitor sat
+        there counting correctly in memory.
+
+        That made the whole venue invisible downstream: allvenues.py reads feeds,
+        so a venue that never writes one cannot appear on the merged screen no
+        matter how busy it is.
+
+        Writes the tokens that are actually TRADING, not every mint ever seen, so
+        the file stays a record of activity rather than of subscription volume.
+        """
+        while True:
+            try:
+                with self.lock:
+                    rows = [dict(r) for r in self.tokens.values()
+                            if (r.get("n_buys") or 0) > 0]
+                for r in rows:
+                    self._journal({
+                        "kind": "token", "venue": "pump.fun",
+                        "mint": r.get("mint"), "symbol": r.get("symbol"),
+                        "name": r.get("name"),
+                        "progress_pct": r.get("progress_pct"),
+                        "n_buys": r.get("n_buys"), "n_buyers": r.get("n_buyers"),
+                        "sol_in": round(r.get("sol_in") or 0.0, 4),
+                        "virt_sol": r.get("virt_sol"),
+                        "first_seen": r.get("first_seen"),
+                    })
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(period)
+
     def near_graduation(self, min_pct=25.0, n=10):
         with self.lock:
             rs = [r for r in self.tokens.values() if (r.get("progress_pct") or 0) >= min_pct]
@@ -442,6 +479,7 @@ def main():
                     help="sample recent StonkFun launches and their quote assets")
     a = ap.parse_args()
     mon = SolMonitor(a)
+    threading.Thread(target=mon.snapshot_worker, daemon=True).start()
     slot = rpc("getSlot", []).get("result")
     print(f"Solana monitor · {' + '.join(v['label'] for v in VENUES.values() if v['enabled'])}"
           f" · slot {slot}")
