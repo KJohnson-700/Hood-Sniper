@@ -2401,7 +2401,10 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
     # The launch floor is about $4,200, so a $6k token is 1.4x -- noise, not a
     # runner, and calling it one is what made this panel untrustworthy. $12k is
     # where the rate first clears a useful bar (32%, a 64x lift over $4-6k).
-    RUN_LO, RUN_HI = 12_000, 48_000
+    # Band narrowed to the operator's call. It is not a loosening: on 574 live rows
+    # with a known mcap, 10k-25k holds 28 and the old 12k-48k held 20, because the
+    # median curve sits at $4.3k and almost nothing reaches the top of the old band.
+    RUN_LO, RUN_HI = 10_000, 25_000
     RUN_PRIME_LO, RUN_PRIME_HI = 20_000, 35_000     # the 86% zone
     RUN_WINDOW = 300.0                   # 5 min of tape
 
@@ -2636,7 +2639,17 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                 continue
             if pct < 5.0 or bshare < 0.55 or vol < 500:
                 continue
-            out.append(dict(r, _mcap=mcap, _pct=pct, _buy=bshare, _vol=vol, _n=ntr))
+            # MUST BE MOVING UP IN THE LAST FEW MINUTES, not merely up overall.
+            # `pct` is measured across the whole 5-minute tape, so a token that
+            # spiked four minutes ago and has been bleeding since still passed it
+            # and sat in the panel looking live. Require the recent leg to be
+            # positive as well, from the same mcap samples the panel already keeps.
+            recent = self.recent_move(r, window=180.0)
+            if recent is None or recent <= 0:
+                continue
+            r = dict(r, _recent=recent)
+            out.append(dict(r, _mcap=mcap, _pct=pct, _buy=bshare, _vol=vol,
+                            _n=ntr, _recent=r.get("_recent")))
         out.sort(key=lambda x: -x["_pct"])
         return out[:n]
 
@@ -2848,6 +2861,27 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
             if len(self.runner) > 400:
                 oldest = min(self.runner, key=lambda k: self.runner[k]["first_seen"])
                 self.runner.pop(oldest, None)
+
+    def recent_move(self, r, window=180.0):
+        """
+        Percent change in mcap over the trailing `window`, from the samples the
+        runner row already carries.
+
+        None when there is not enough history -- two samples is not a trend, and a
+        made-up number next to real ones is worse than a blank. Same rule as
+        violence().
+        """
+        h = r.get("samples") or []
+        if len(h) < 3:
+            return None
+        now = time.time()
+        rec = [x for x in h if now - x[0] <= window]
+        if len(rec) < 3:
+            return None
+        first, last = rec[0][1], rec[-1][1]
+        if not first:
+            return None
+        return 100.0 * (last - first) / first
 
     def postgrad_motion(self, r):
         """
@@ -3403,13 +3437,31 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
                     pass
 
     def near_grad_rows(self):
-        """Curves at or above the HEATING line, hottest first."""
+        """
+        Curves past the heating line, ranked by VIOLENCE then progress.
+
+        Gated on curve_progress, not curve_eth. The ETH-balance field is present on
+        only 33% of live rows (280 of 859 measured) because it is ~0 for every
+        non-ETH-quoted curve -- and 37% of graduations are USDG or tokenized
+        equities. curve_progress covers 83% and is quote-agnostic, so this panel was
+        blind to two thirds of the board, which is why nothing ever appeared in it
+        to confirm a RUNNERS row.
+
+        Violence leads the sort so the panel answers "which of these is moving
+        RIGHT NOW", which is the confirmation a runner needs. Progress breaks ties.
+        """
         with self.lock:
             rs = [e for e in self.detail.values()
-                  if (e.get("curve_eth") or 0) >= self.HEATING_ETH
+                  if (e.get("curve_progress") or 0) >= HEATING_PROG_FLOOR
                   and e.get("pre_grad") and not e.get("graduated")]
-        rs.sort(key=lambda e: -(e.get("curve_eth") or 0))
-        return rs[:8]
+        out = []
+        for e in rs:
+            v = self.violence(e)
+            out.append((0 if v is None else -v, -(e.get("curve_progress") or 0), e, v))
+        out.sort(key=lambda x: (x[0], x[1]))
+        for _a, _b, e, v in out:
+            e["_violence"] = v
+        return [e for _a, _b, e, _v in out][:8]
 
     def account_worker(self):
         """Wallet balance, daily caps and realised P&L. Cheap, once every 30s."""
@@ -4180,15 +4232,18 @@ def build_view(mon):
     if pg:
         pt = Table(expand=True, box=None, show_header=True, header_style="bold")
         for c, j in (("symbol", "left"), ("mcap", "right"), ("5m move", "right"),
-                     ("buy side", "right"), ("5m vol", "right"), ("trades", "right"),
-                     ("contract", "left")):
+                     ("3m move", "right"), ("buy side", "right"), ("5m vol", "right"),
+                     ("trades", "right"), ("contract", "left")):
             pt.add_column(c, justify=j, no_wrap=True)
         for r in pg:
             pc = ("bold white on green" if r["_pct"] >= 25
                   else "bold green" if r["_pct"] >= 10 else "green")
             bc = "bold green" if r["_buy"] >= 0.7 else "green"
+            rv = r.get("_recent")
+            rvs = ("[dim]…[/]" if rv is None else
+                   f"[{'bold green' if rv >= 10 else 'green'}]{rv:+.0f}%[/]")
             pt.add_row((r.get("symbol") or "?")[:12], fmt_usd(r["_mcap"]),
-                       f"[{pc}]+{r['_pct']:.0f}%[/]", f"[{bc}]{r['_buy']:.0%}[/]",
+                       f"[{pc}]+{r['_pct']:.0f}%[/]", rvs, f"[{bc}]{r['_buy']:.0%}[/]",
                        fmt_usd(r["_vol"]), str(r["_n"]),
                        # full address, not [:22] -- a cut-off contract cannot be
                        # pasted into a scanner or a buy, so it may as well be blank
@@ -4207,13 +4262,19 @@ def build_view(mon):
     if ng:
         gt = Table(expand=True, box=None, show_header=True, header_style="bold")
         for c, j in (("tier", "left"), ("symbol", "left"), ("progress", "left"),
-                     ("raised", "right"), ("of curve", "right"), ("mcap", "right"),
-                     ("smart", "right"), ("tax", "right"), ("age", "right")):
+                     ("violence", "right"), ("of curve", "right"), ("mcap", "right"),
+                     ("smart", "right"), ("tax", "right"), ("age", "right"),
+                     ("contract", "left")):
             gt.add_column(c, justify=j, no_wrap=True)
         for e in ng:
+            # PROGRESS, not the ETH balance. curve_eth is ~0 on every non-ETH-quoted
+            # curve and was present on only 33% of live rows, so the old panel could
+            # not see most of the board -- and a confirmation panel that shows a
+            # third of candidates confirms nothing.
+            prog = e.get("curve_progress")
             eth = e.get("curve_eth") or 0.0
-            pct = 100 * eth / mon.GRAD_ETH
-            near = eth >= mon.NEAR_GRAD_ETH
+            pct = 100 * (prog if prog is not None else (eth / mon.GRAD_ETH))
+            near = pct >= 100 * NEAR_GRAD_PROG_FLOOR
             tier = ("[bold white on green] NEAR GRAD [/]" if near
                     else "[bold yellow]heating[/]")
             filled = int(min(pct, 100) / 10)
@@ -4224,11 +4285,20 @@ def build_view(mon):
             agestr = ("-" if secs is None else f"{secs:.0f}s" if secs < 90
                       else f"{secs/60:.0f}m" if secs < 5400 else f"{secs/3600:.1f}h")
             tx = e.get("tax_bps")
-            gt.add_row(tier, (e.get("symbol") or "?")[:12], bar, fmt_usd(eth * ETH_USD),
+            v = e.get("_violence")
+            if v is None:
+                vs = "[dim]…[/]"
+            else:
+                vc = ("bold white on green" if v >= 50 else "bold green" if v >= 20
+                      else "green" if v > 0 else "red")
+                vs = f"[{vc}]{v:+.0f}%[/]"
+            gt.add_row(tier, (e.get("symbol") or "?")[:12], bar, vs,
                        f"{pct:.0f}%", fmt_usd(e.get("mcap")),
                        f"[bold yellow]★{ns}[/]" if ns >= 2 else (f"★{ns}" if ns else "-"),
-                       f"{tx/100:.1f}%" if tx is not None else "-", agestr)
-        n_near = sum(1 for e in ng if (e.get("curve_eth") or 0) >= mon.NEAR_GRAD_ETH)
+                       f"{tx/100:.1f}%" if tx is not None else "-", agestr,
+                       e.get("token") or e.get("curve") or "-")
+        n_near = sum(1 for e in ng
+                     if (e.get("curve_progress") or 0) >= NEAR_GRAD_PROG_FLOOR)
         panels.append(Panel(gt, border_style="green",
                             title=f"[bold green]NEAR GRADUATION[/] [bold black on green] g [/] — "
                                   f"grad at {fmt_usd(mon.GRAD_ETH*ETH_USD)} raised "
