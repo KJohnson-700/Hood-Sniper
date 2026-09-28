@@ -74,9 +74,41 @@ def fetch_pairs(log=print):
     pairs = d.get("data") if isinstance(d.get("data"), list) else (
         d.get("data", {}).get("pairs") or d.get("pairs") or [])
     ts = time.time()
+    # WRITE ONLY WHAT CHANGED. The full list is ~200 KB, so snapshotting all 524
+    # pairs every 10 minutes grew the file to 265 MB across 1,415 snapshots -- about
+    # 40 MB/day, unbounded, to answer a question ("which pair is new") that only
+    # needs the diff. The first snapshot stores the whole list as a baseline; after
+    # that only additions and removals are recorded.
+    prev = set()
+    if os.path.exists(PAIRS):
+        try:
+            with open(PAIRS) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for m in (rec.get("added") or []):
+                        prev.add(m if isinstance(m, str) else m.get("mint"))
+                    for m in (rec.get("removed") or []):
+                        prev.discard(m)
+                    for p_ in (rec.get("pairs") or []):
+                        prev.add(p_.get("mint"))
+        except Exception:  # noqa: BLE001
+            prev = set()
+    cur = {p_.get("mint"): p_ for p_ in pairs if p_.get("mint")}
+    if not prev:
+        rec = {"ts": ts, "n": len(pairs), "pairs": pairs, "baseline": True}
+    else:
+        added = [cur[m] for m in cur if m not in prev]
+        removed = [m for m in prev if m not in cur]
+        rec = {"ts": ts, "n": len(pairs), "added": added, "removed": removed}
+        if added:
+            log(f"  NEW PAIRS: {', '.join(str(a.get('symbol')) for a in added[:6])}")
     with open(PAIRS, "a") as f:
-        f.write(json.dumps({"ts": ts, "n": len(pairs), "pairs": pairs}) + "\n")
-    log(f"  pairs snapshot: {len(pairs)} launchable")
+        f.write(json.dumps(rec) + "\n")
+    log(f"  pairs snapshot: {len(pairs)} launchable"
+        + (f" (+{len(rec.get('added') or [])} new)" if rec.get("added") else ""))
     return pairs
 
 

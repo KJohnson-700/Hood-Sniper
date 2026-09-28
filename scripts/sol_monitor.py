@@ -120,10 +120,55 @@ JOURNAL = os.path.join(DATA, "sol_feed.jsonl")
 # pump.fun curve constants, used only for PROGRESS. They are stated here as
 # assumptions rather than measured facts -- unlike the Pons 4.0 ETH threshold,
 # which was measured off real graduations. Verify before trusting the % figure.
+# MEASURED 2026-09-27 off live TradeEvents, no longer assumed.
+#
+# The bonding curve is constant-product: virtual_sol_reserves * virtual_token_reserves
+# is invariant. Four consecutive live events gave
+#     vsol 30.1681  vtok 1,067,019,562
+#     vsol 33.3500  vtok   965,216,567
+#     vsol 51.5192  vtok   624,816,038
+#     vsol 79.3766  vtok   405,534,934
+# k = 3.218998e10 with a spread of 0.0002%, so the invariant is real.
+#
+# INIT_VIRT_SOL = 30 is CONFIRMED: k/30 implies 1,072,999,434 initial virtual
+# tokens against pump.fun's documented 1,073,000,000 -- a 0.00% difference.
+#
+# GRAD_VIRT_SOL = 85 WAS WRONG. 85 is the REAL SOL raised at completion; this
+# formula divides VIRTUAL reserves, and virtual = 30 + real. The curve completes
+# after 793,100,000 of the 1,073,000,000 virtual tokens are sold, leaving
+# 279,899,434, so vsol at graduation = k/279,899,434 = 115.01 SOL -- which is
+# exactly 30 + 85.01, confirming both numbers at once.
+#
+# The old denominator (85-30=55 instead of 115-30=85) overstated progress by ~55%:
+# a token at vsol 79.38 read 89.8% ("about to graduate") when it was really 58.1%.
+# That also explains why 3.5% of recorded snapshots sat above the supposed ceiling.
 INIT_VIRT_SOL = 30.0
-GRAD_VIRT_SOL = 85.0
+GRAD_VIRT_SOL = 115.01
 TOTAL_SUPPLY = 1_000_000_000
-SOL_USD = 210.0
+# Checked against Coinbase spot 2026-09-27: SOL was 121.03, not 210. Every mcap
+# this module printed was overstated 1.74x, which matters because the operator
+# screens on a $10k-$25k band -- a token reading $17k was really $10k.
+# Refreshed at startup from spot; the constant is only the fallback.
+SOL_USD = 121.0
+
+
+def refresh_sol_usd(log=print):
+    """Live SOL price. A hardcoded price silently rescales every mcap on screen."""
+    global SOL_USD
+    try:
+        req = urllib.request.Request(
+            "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            px = float(json.load(r)["data"]["amount"])
+        if 5.0 < px < 2000.0:          # refuse an absurd value rather than adopt it
+            SOL_USD = px
+            log(f"  SOL/USD {px:.2f} (live)")
+            return px
+    except Exception:  # noqa: BLE001
+        pass
+    log(f"  SOL/USD {SOL_USD:.2f} (fallback -- spot fetch failed)")
+    return SOL_USD
 
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -198,6 +243,13 @@ def decode_create(b):
 def curve_metrics(virt_sol, virt_tokens):
     """price / mcap / progress from the reserves the venue itself published."""
     if not virt_tokens:
+        return {}
+    # VIRTUAL SOL CANNOT BE BELOW THE INITIAL RESERVE. virtual = 30 + real, and real
+    # never goes negative, so anything under 30 is a bad decode rather than an early
+    # token. 21% of recorded snapshots had values like 0.055 and 2.513 -- those
+    # produced a progress number from nonsense. Return no metrics instead: a blank
+    # cell is honest, a computed percentage from a bad parse is not.
+    if virt_sol < INIT_VIRT_SOL * 0.999:
         return {}
     price_sol = virt_sol / virt_tokens
     prog = 100 * (virt_sol - INIT_VIRT_SOL) / (GRAD_VIRT_SOL - INIT_VIRT_SOL)
@@ -478,6 +530,7 @@ def main():
     ap.add_argument("--stonkfun", type=int, nargs="?", const=40,
                     help="sample recent StonkFun launches and their quote assets")
     a = ap.parse_args()
+    refresh_sol_usd()
     mon = SolMonitor(a)
     threading.Thread(target=mon.snapshot_worker, daemon=True).start()
     slot = rpc("getSlot", []).get("result")
