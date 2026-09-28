@@ -1224,6 +1224,9 @@ def _gmgn_cached(token, chain="robinhood", log=print):
     return d, err
 
 
+GMGN_CLI_VERSION = "1.6.6"       # pinned; see the note in _gmgn()
+
+
 def _gmgn(args, timeout=45):
     """
     Shell out to gmgn-cli. Returns (data, err); err is a STRING on failure so a
@@ -1237,7 +1240,16 @@ def _gmgn(args, timeout=45):
     # never expose a signing key to this path -- we read data, we do not trade here
     env.pop("GMGN_PRIVATE_KEY", None)
     try:
-        r = subprocess.run(["npx", "-y", "gmgn-cli@latest"] + args,
+        # PINNED, NOT @latest. `npx -y gmgn-cli@latest` downloads and executes the
+        # newest published version on every single call, auto-confirmed. That is the
+        # update-path risk in its purest form: a clean package today, a malicious
+        # publish tomorrow, running unattended on the machine that holds .env. The
+        # API key is passed in this environment (the signing key is popped above),
+        # so a compromised release would have it.
+        #
+        # Pinning costs nothing and removes the exposure. Bump deliberately after
+        # looking at what changed, never automatically.
+        r = subprocess.run(["npx", "-y", f"gmgn-cli@{GMGN_CLI_VERSION}"] + args,
                            capture_output=True, text=True, timeout=timeout, env=env)
     except Exception as ex:  # noqa: BLE001
         return None, str(ex)[:40]
