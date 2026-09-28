@@ -1169,6 +1169,7 @@ class Monitor:
         # and lets the poller take over immediately on a dead-WS start
         self.ws_last_msg = 0.0
         self.sol_rows = []             # Solana rows tailed from the sol collectors
+        self.vamp_runners = {}         # TICKER -> ts it was last seen running
         # the one validated signal -- see smart_money.py for what was tested
         self.smart = SmartWatch() if SmartWatch else None
         self.autovet_q = deque()       # curves awaiting background vetting
@@ -2520,6 +2521,20 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
         if pct is not None:
             e["stake_pct_of_pot"] = pct
 
+        # VAMP is a positive marker, not a kill flag -- a token reusing a ticker
+        # that ran in the last 24h graduates 5.66% vs 3.12% (n=4,662 vs 55,648).
+        # It goes in `good` deliberately: putting it in `flags` would feed is_clean
+        # and quietly filter out the strongest cohort on the board.
+        try:
+            va = self.vamp_age_h(e)
+            if va is not None and va <= self.VAMP_WINDOW_H:
+                e["vamp_age_h"] = round(va, 1)
+                tag = f"VAMP {va:.0f}h"
+                if tag not in e.setdefault("good", []):
+                    e["good"].append(tag)
+        except Exception:  # noqa: BLE001
+            pass
+
         prog = e.get("curve_progress")
         if prog is None:
             return
@@ -3431,6 +3446,95 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
             except Exception as ex:  # noqa: BLE001
                 self.stats["sol_err"] = f"{type(ex).__name__}: {ex}"[:70]
             time.sleep(self.SOL_REFRESH)
+
+    # ---------------------------------------------------------------- vamps
+    VAMP_RUNNER_MCAP = 50_000.0   # what counts as "this ticker ran"
+    VAMP_WINDOW_H = 24.0          # the window where the effect actually lives
+    VAMP_REFRESH = 180.0
+
+    def vamp_worker(self):
+        """
+        Label tokens reusing a ticker that RAN recently. Label, never filter.
+
+        MEASURED ON 70,185 StonkFun tokens, and the result is the opposite of the
+        intuition -- which is exactly why this marks rather than removes:
+
+            no prior runner on the ticker   n=55,648   3.12% graduated   2.11% >=$50k
+            runner <24h earlier  (VAMP)     n= 4,662   5.66%             4.48%
+            runner 1-7d earlier             n= 4,935   3.57%             2.31%
+            runner >7d earlier              n= 4,940   3.44%             1.86%
+
+        A token launched within 24h of a same-ticker runner graduates 1.8x as often
+        and reaches $50k 2.1x as often. Filtering "copycats" out would have removed
+        the best cohort on the board. The effect decays to nothing by a week, which
+        is what an attention-driven mechanism looks like.
+
+        Plain ticker reuse is NOT the signal and is not labelled: originals graduate
+        2.84% against 4.09% for a third-to-fifth use, so "first use of a name" says
+        nothing. Only a RECENT RUNNER on the same ticker does.
+
+        Built from every feed we have -- ours plus GMGN's cross-chain list -- so a
+        ticker that ran on Solana still marks a Robinhood Chain launch. Attention
+        does not respect chains.
+        """
+        import glob
+        while self.running:
+            try:
+                runners = {}      # TICKER -> most recent ts it was seen >= threshold
+                for name in ("monitor_feed.jsonl", "gmgn_feed.jsonl",
+                             "sol_feed.jsonl", "stonkfun_feed.jsonl"):
+                    path = os.path.join(DATA, name)
+                    if not os.path.exists(path):
+                        continue
+                    try:
+                        sz = os.path.getsize(path)
+                        with open(path, "rb") as f:
+                            f.seek(max(0, sz - 12_000_000))
+                            lines = f.read().decode("utf8", "ignore").split("\n")[1:]
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for line in lines:
+                        try:
+                            r = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        sym = r.get("symbol")
+                        mc = r.get("mcap") or r.get("mcap_usd") or r.get("market_cap")
+                        if not sym or not mc or mc < self.VAMP_RUNNER_MCAP:
+                            continue
+                        t = r.get("ts")
+                        if isinstance(t, str):
+                            try:
+                                t = datetime.fromisoformat(
+                                    t.replace("Z", "+00:00")).timestamp()
+                            except Exception:  # noqa: BLE001
+                                continue
+                        if not isinstance(t, (int, float)):
+                            continue
+                        k = str(sym).strip().upper().lstrip("$")
+                        if t > runners.get(k, 0):
+                            runners[k] = t
+                with self.lock:
+                    self.vamp_runners = runners
+            except Exception as ex:  # noqa: BLE001
+                self.stats["vamp_err"] = f"{type(ex).__name__}"[:40]
+            time.sleep(self.VAMP_REFRESH)
+
+    def vamp_age_h(self, e):
+        """Hours since a same-ticker token last ran, or None. Excludes the token
+        itself: a runner cannot be its own precedent."""
+        sym = e.get("symbol")
+        if not sym:
+            return None
+        k = str(sym).strip().upper().lstrip("$")
+        with self.lock:
+            t = self.vamp_runners.get(k)
+        if not t:
+            return None
+        mc = e.get("mcap") or 0
+        if mc >= self.VAMP_RUNNER_MCAP:
+            return None          # this row IS the runner, not a vamp of one
+        return (time.time() - t) / 3600.0
 
     def resolve_pool_symbols(self, limit=12):
         """
@@ -4808,6 +4912,7 @@ def main():
     threading.Thread(target=mon.progress_worker, daemon=True).start()
     threading.Thread(target=mon.refresh_worker, daemon=True).start()
     threading.Thread(target=mon.sol_worker, daemon=True).start()
+    threading.Thread(target=mon.vamp_worker, daemon=True).start()
     threading.Thread(target=mon.poll_worker, daemon=True).start()
     # seed off-thread: it is one scan and must not delay the first frame
     threading.Thread(target=mon.seed_pools, daemon=True).start()
