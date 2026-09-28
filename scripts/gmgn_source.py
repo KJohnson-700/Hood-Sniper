@@ -86,12 +86,27 @@ def pull(chain, stage, limit=80, log=print):
     return rows
 
 
-def snapshot(log=print):
+def snapshot(stages=None, log=print):
+    """
+    One pass. `stages` limits which categories are pulled, because they do not
+    move at the same speed and polling them equally wastes the budget:
+
+      new_creation / near_completion   change constantly -- this is where an entry
+                                       decision lives, so freshness matters
+      completed                        already graduated; it is a slow-moving
+                                       reference list, not a trading signal
+
+    Measured: one CLI call is ~0.6-0.9s and 12 back-to-back calls drew no rate
+    limiting, so the constraint is politeness rather than throughput. Splitting the
+    cadence buys 4x freshness on the actionable stages for well under double the
+    calls.
+    """
     ts = time.time()
     n = 0
+    use = tuple(stages) if stages else STAGES
     with open(FEED, "a") as f:
         for chain in CHAINS:
-            for stage in STAGES:
+            for stage in use:
                 for r in pull(chain, stage, log=log):
                     f.write(json.dumps({
                         "ts": ts, "src": "gmgn", "chain": chain, "stage": stage,
@@ -152,11 +167,13 @@ def top(limit=15, min_smart=1, log=print):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", action="store_true")
+    ap.add_argument("--stages", nargs="*", default=None,
+                    help="limit to these stages (default all three)")
     ap.add_argument("--top", action="store_true")
     ap.add_argument("--min-smart", type=int, default=1)
     a = ap.parse_args()
     if a.snapshot:
-        snapshot()
+        snapshot(stages=a.stages)
     elif a.top:
         top(min_smart=a.min_smart)
     else:

@@ -349,6 +349,83 @@ class SolMonitor:
                                            ("buy" if is_buy else "sell")),
                        "instr": kind, "sig": v.get("signature"), "venue": "stonkfun"})
 
+    # DAS is served by api.mainnet-beta, NOT by publicnode -- the same per-method
+    # endpoint split that bit us on Robinhood Chain, where one host answered
+    # eth_blockNumber fine and 403'd every eth_getLogs.
+    DAS_RPC = "https://api.mainnet-beta.solana.com"
+    SYM_CACHE = os.path.join(DATA, "sol_symbols.json")
+
+    def _load_symbols(self):
+        try:
+            return json.load(open(self.SYM_CACHE))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def symbol_worker(self, period=6.0, batch=8):
+        """
+        Fill in token names the trade stream cannot provide.
+
+        pump.fun's TradeEvent carries no name -- only CreateEvent does -- so any
+        token we first see from a trade is nameless, and that is the majority of
+        the board. A mint is pasteable but not readable, and the operator cannot
+        recognise what they are looking at.
+
+        Metaplex metadata via DAS getAsset fills it: KAWAII, V-BUCKS, PSA10 all
+        resolved in testing. getAssetBatch returns nulls on the public endpoint, so
+        this goes one at a time and caches to disk -- a name never changes, so a
+        mint is looked up once ever.
+
+        Prioritised by curve progress: the tokens near the top of the board get
+        names first, because a name on a 0%-progress mint nobody will look at is
+        wasted budget.
+        """
+        cache = self._load_symbols()
+        with self.lock:
+            for m, sym in cache.items():
+                r = self.tokens.get(m)
+                if r and not r.get("symbol"):
+                    r["symbol"] = sym
+        while True:
+            try:
+                with self.lock:
+                    todo = [(r.get("progress_pct") or 0, m)
+                            for m, r in self.tokens.items()
+                            if not r.get("symbol") and m not in cache
+                            and (r.get("n_buys") or 0) > 0]
+                todo.sort(reverse=True)
+                for _pg, mint in todo[:batch]:
+                    sym = self._das_symbol(mint)
+                    # cache the MISS too, as empty string: an unindexed mint would
+                    # otherwise be retried forever at the top of every pass
+                    cache[mint] = sym or ""
+                    if sym:
+                        with self.lock:
+                            r = self.tokens.get(mint)
+                            if r:
+                                r["symbol"] = sym
+                    time.sleep(0.25)
+                if todo:
+                    try:
+                        json.dump(cache, open(self.SYM_CACHE, "w"))
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as ex:  # noqa: BLE001
+                self.stats["sym_err"] = f"{type(ex).__name__}"[:40]
+            time.sleep(period)
+
+    def _das_symbol(self, mint):
+        try:
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getAsset",
+                               "params": {"id": mint}}).encode()
+            req = urllib.request.Request(self.DAS_RPC, data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.load(r)
+            md = ((d.get("result") or {}).get("content") or {}).get("metadata") or {}
+            return md.get("symbol") or None
+        except Exception:  # noqa: BLE001
+            return None
+
     def snapshot_worker(self, period=20.0):
         """
         Journal the LIVE pump.fun token state on a timer.
@@ -534,6 +611,7 @@ def main():
     refresh_sol_usd()
     mon = SolMonitor(a)
     threading.Thread(target=mon.snapshot_worker, daemon=True).start()
+    threading.Thread(target=mon.symbol_worker, daemon=True).start()
     slot = rpc("getSlot", []).get("result")
     print(f"Solana monitor · {' + '.join(v['label'] for v in VENUES.values() if v['enabled'])}"
           f" · slot {slot}")
