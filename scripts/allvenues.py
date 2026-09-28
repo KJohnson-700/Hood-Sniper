@@ -68,6 +68,37 @@ def _ts(r):
     return None
 
 
+def _score(r):
+    """
+    How interesting a row is, for ranking. Recency alone puts a just-minted 0%
+    token above one that is 60% up its curve with wallets stacking, which is the
+    opposite of useful -- the newest row is almost always the emptiest.
+
+    Venue-specific, because the venues do not measure the same thing:
+      pump.fun / pons   how far up the curve it is
+      stonkfun          how early it is on its PAIR (rank 1-5 graduates 22.8%
+                        vs 2.38% for rank 101+), so low rank scores HIGH
+      bsc               no curve to be early on, so it ranks on recency only
+    """
+    sig = r.get("signal") or ""
+    flags = r.get("flags") or []
+    sc = 0.0
+    if "of curve" in sig or "up curve" in sig:
+        try:
+            sc = float(sig.split("%")[0])
+        except Exception:  # noqa: BLE001
+            sc = 0.0
+    elif sig.startswith("#"):
+        try:
+            rank = int(sig[1:].split(" ")[0])
+            sc = max(0.0, 100.0 - rank)      # rank 1 -> 99, rank 101+ -> 0
+        except Exception:  # noqa: BLE001
+            sc = 0.0
+    if "MOMENTUM" in flags or "FIRST-5" in flags:
+        sc += 50.0
+    return sc
+
+
 def _norm(src, chain, r):
     if src == "pons":
         return {"ts": _ts(r), "chain": chain, "venue": r.get("venue") or "pons",
@@ -99,7 +130,7 @@ def _norm(src, chain, r):
         return {"ts": _ts(r), "chain": chain, "venue": "pump.fun",
                 "symbol": r.get("symbol") or (mint[:10] + "…" if mint else None),
                 "id": mint,
-                "mcap": None, "liq": None,
+                "mcap": r.get("mcap_usd"), "liq": None,
                 # progress uses INIT/GRAD virtual-SOL constants the module itself
                 # marks as assumptions, not measured like the Pons 4.2 ETH figure
                 "signal": (f"{pp:.0f}% of curve" if pp is not None else ""),
@@ -139,7 +170,28 @@ def collect(limit=40):
         out.extend(seen.values())
     out = [r for r in out if r["ts"]]
     out.sort(key=lambda r: r["ts"], reverse=True)
-    return out[:limit]
+    # FAIR SHARE PER VENUE. pump.fun snapshots its whole token set every 20s with
+    # one identical timestamp, so a pure time sort put 200+ pump.fun rows at the
+    # top and pushed every other chain off the screen entirely -- the busiest
+    # collector won the display rather than the most interesting tokens.
+    per = max(3, limit // max(1, len(FEEDS)))
+    # rank by signal within each venue, not by arrival time
+    out.sort(key=lambda r: (-_score(r), -(r["ts"] or 0)))
+    picked, counts = [], {}
+    for r in out:
+        k = r["venue"]
+        if counts.get(k, 0) >= per:
+            continue
+        counts[k] = counts.get(k, 0) + 1
+        picked.append(r)
+        if len(picked) >= limit:
+            break
+    # backfill any unused slots from whatever is left, newest first
+    if len(picked) < limit:
+        got = {id(x) for x in picked}
+        picked += [r for r in out if id(r) not in got][:limit - len(picked)]
+    picked.sort(key=lambda r: (-_score(r), -(r["ts"] or 0)))
+    return picked
 
 
 def rates(window_min=60.0):

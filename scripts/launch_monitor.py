@@ -997,6 +997,15 @@ CURVE_SUPPLY = 714285714285714285714285715
 # expensive-looking ones: $800 of liquidity is already 25% up the curve.
 CURVE_LATE_PCT = 0.25
 
+# The two crossing levels expressed in TOKEN PROGRESS, shared by the crossing
+# detector and the NEAR-GRAD panel so they cannot drift apart. Converted by
+# measuring where the ETH thresholds land on ETH-quoted graduated curves:
+#     0.1 ETH -> 9.3% of supply sold      2.0 ETH -> 75.5%
+# Progress is the quote-agnostic unit; curve_eth is ~0 on the 37% of curves quoted
+# in USDG or tokenized equities.
+HEATING_PROG_FLOOR = 0.093
+NEAR_GRAD_PROG_FLOOR = 0.755
+
 # Round-trip price impact measured off the tapes is ~1.6x your share of the pot,
 # so a flat $25 into a $300 curve costs 13.3% and eats most of the edge; $40 turns
 # the trade negative outright. Size as a share of the pot instead.
@@ -1159,6 +1168,7 @@ class Monitor:
         # 0 means "never heard from the stream", which correctly reads as silent
         # and lets the poller take over immediately on a dead-WS start
         self.ws_last_msg = 0.0
+        self.sol_rows = []             # Solana rows tailed from the sol collectors
         # the one validated signal -- see smart_money.py for what was tested
         self.smart = SmartWatch() if SmartWatch else None
         self.autovet_q = deque()       # curves awaiting background vetting
@@ -2568,15 +2578,24 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
         return prog is None or prog < CURVE_LATE_PCT
 
     def is_moving(self, curve, min_trades=3, min_usd=100.0):
-        """Any real tape in the last 5 minutes? Cheap — no RPC, pure stream state."""
+        """
+        Any real tape in the last 5 minutes? Cheap — no RPC, pure stream state.
+
+        Applies the cutoff itself, for the same reason curve_motion does: the
+        pruning in on_curve_trade only runs when a NEW trade arrives, so a curve
+        that went quiet keeps its last burst indefinitely and would read as moving
+        forever. This function is also the swell gate's escape hatch, so a stale
+        buffer here would let dead rows back onto the board.
+        """
         if not curve:
             return False
+        cut = time.time() - self.RUN_WINDOW
         with self.lock:
             r = self.curveflow.get(curve)
             if not r:
                 return False
-            tr = r["trades"]
-            return len(tr) >= min_trades and sum(t[2] for t in tr) >= min_usd
+            tr = [t for t in r["trades"] if t[0] >= cut]
+        return len(tr) >= min_trades and sum(t[2] for t in tr) >= min_usd
 
     def violence(self, e, window=90.0):
         """
@@ -2601,13 +2620,28 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
         """
         (buy_usd, sell_usd, buy_share, n_trades, n_wallets) over the window.
         None when the tape is too thin to mean anything.
+
+        THE WINDOW IS APPLIED HERE, not trusted from the writer. on_curve_trade
+        prunes old trades -- but only when a NEW trade arrives for that curve. A
+        curve that stops trading is never visited again, so its final burst sat in
+        the list forever and this function kept reporting it as live motion.
+
+        Measured on a reported row: curve 0x243ce88c had ZERO trades on chain in
+        the last 400,000 blocks (~11 hours) and was still being served as a RUNNER.
+        Reading a stale buffer as "moving now" is the worst failure this panel can
+        have, because the whole point of it is recency.
         """
+        now = time.time()
+        cut = now - self.RUN_WINDOW
         with self.lock:
             r = self.curveflow.get(curve)
             if not r:
                 return None
-            tr = list(r["trades"])
-            nw = len(r["wallets"])
+            tr = [t for t in r["trades"] if t[0] >= cut]
+            # wallets is a plain set with no timestamps, so it cannot be filtered;
+            # fall back to distinct wallets seen IN the window, which is the number
+            # the panel actually means
+            nw = len({t[3] for t in tr if len(t) > 3}) or len(r["wallets"])
         if len(tr) < 4:
             return None
         b = sum(t[2] for t in tr if t[1])
@@ -3332,6 +3366,71 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
             except Exception as ex:  # noqa: BLE001
                 self.stats["poll_err"] = f"{type(ex).__name__}: {ex}"[:80]
             time.sleep(self.POLL_EVERY)
+
+    # ------------------------------------------------- Solana rows in the bot
+    SOL_FEEDS = ("sol_feed.jsonl", "stonkfun_feed.jsonl")
+    SOL_REFRESH = 12.0
+
+    def sol_worker(self):
+        """
+        Pull Solana rows into the bot itself.
+
+        The operator does not want a second screen. pump.fun is running ~2,100 new
+        tokens/hr against 520 on Pons, so the highest-volume venue we track was
+        visible only in a separate viewer -- which means it was not in the tool
+        being watched.
+
+        Reads the FEEDS the Solana collectors write rather than opening its own
+        connections: launch_monitor is EVM down to its selectors and state-override
+        probes, and putting a Solana RPC loop inside it would mean one chain's
+        outage taking down both. File tail only, no network, cannot break the RHC
+        side.
+        """
+        while self.running:
+            try:
+                rows = []
+                for name in self.SOL_FEEDS:
+                    path = os.path.join(DATA, name)
+                    if not os.path.exists(path):
+                        continue
+                    try:
+                        sz = os.path.getsize(path)
+                        with open(path, "rb") as f:
+                            f.seek(max(0, sz - 700_000))
+                            lines = f.read().decode("utf8", "ignore").split("\n")[1:]
+                    except Exception:  # noqa: BLE001
+                        continue
+                    seen = {}
+                    for line in lines:
+                        try:
+                            r = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if r.get("kind") == "token" and r.get("mint"):
+                            pg = r.get("progress_pct")
+                            seen[r["mint"]] = {
+                                "venue": "pump.fun", "sym": r.get("symbol"),
+                                "id": r["mint"], "mcap": r.get("mcap_usd"),
+                                "score": (pg or 0) + (50 if (r.get("n_buyers") or 0) >= 10 else 0),
+                                "sig": (f"{pg:.0f}% curve" if pg is not None else "-"),
+                                "buyers": r.get("n_buyers")}
+                        elif r.get("venue") == "stonkfun" and r.get("mint"):
+                            rk = r.get("rank_on_pair")
+                            seen[r["mint"]] = {
+                                "venue": "stonkfun", "sym": r.get("symbol"),
+                                "id": r["mint"], "mcap": r.get("mcap"),
+                                # rank 1 on a pair graduates 22.8% vs 2.38% at 101+,
+                                # so EARLY on the pair outranks far-up-the-curve
+                                "score": (max(0, 120 - rk) if rk else 0),
+                                "sig": (f"#{rk} on ${r.get('quote')}" if rk else "-"),
+                                "buyers": None}
+                    rows.extend(seen.values())
+                rows.sort(key=lambda r: -r["score"])
+                with self.lock:
+                    self.sol_rows = rows[:8]
+            except Exception as ex:  # noqa: BLE001
+                self.stats["sol_err"] = f"{type(ex).__name__}: {ex}"[:70]
+            time.sleep(self.SOL_REFRESH)
 
     def resolve_pool_symbols(self, limit=12):
         """
@@ -4227,6 +4326,37 @@ def build_view(mon):
                                   f"[dim](ranked by 90s VELOCITY — top-third movers "
                                   f"peaked 2.33x vs 1.57x, n=72)[/]"))
 
+    # ---- SOLANA (pump.fun + StonkFun) --------------------------------------
+    with mon.lock:
+        sr = list(mon.sol_rows)
+    if sr:
+        st_ = Table(expand=True, box=None, show_header=True, header_style="bold")
+        for c, j in (("venue", "left"), ("symbol", "left"), ("mcap", "right"),
+                     ("signal", "right"), ("buyers", "right"), ("mint", "left")):
+            st_.add_column(c, justify=j, no_wrap=True)
+        for r in sr:
+            sig = r["sig"]
+            if "curve" in sig:
+                try:
+                    pv = float(sig.split("%")[0])
+                except Exception:  # noqa: BLE001
+                    pv = 0.0
+                sc = ("bold white on green" if pv >= 80 else "bold green"
+                      if pv >= 50 else "green" if pv >= 20 else "yellow")
+            else:
+                # rank 1-5 on a pair is the 9.6x cohort -- 22.8% graduate vs 2.38%
+                sc = "bold white on green" if sig.startswith(("#1 ", "#2 ", "#3 ",
+                                                              "#4 ", "#5 ")) else "green"
+            st_.add_row(r["venue"], (r["sym"] or "?")[:14], fmt_usd(r["mcap"]),
+                        f"[{sc}]{sig}[/]",
+                        str(r["buyers"]) if r["buyers"] is not None else "-",
+                        r["id"])
+        panels.append(Panel(st_, border_style="bright_yellow",
+                            title="[bold bright_yellow]SOLANA[/] — pump.fun + StonkFun "
+                                  "[dim](pump.fun runs ~2,100 new tokens/hr vs 520 on "
+                                  "Pons; #1-5 on a StonkFun pair graduates 22.8% vs "
+                                  "2.38% at rank 101+)[/]"))
+
     # ---- POST-GRADUATION RUNNERS -------------------------------------------
     pg = mon.postgrad_runners()
     if pg:
@@ -4677,6 +4807,7 @@ def main():
         threading.Thread(target=mon.autovet_worker, daemon=True).start()
     threading.Thread(target=mon.progress_worker, daemon=True).start()
     threading.Thread(target=mon.refresh_worker, daemon=True).start()
+    threading.Thread(target=mon.sol_worker, daemon=True).start()
     threading.Thread(target=mon.poll_worker, daemon=True).start()
     # seed off-thread: it is one scan and must not delay the first frame
     threading.Thread(target=mon.seed_pools, daemon=True).start()

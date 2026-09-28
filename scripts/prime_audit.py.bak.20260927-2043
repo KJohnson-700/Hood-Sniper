@@ -46,11 +46,7 @@ def _rows():
         prev = out.get(c) or {}
         for k, v in r.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                cur = prev.get(k)
-                if isinstance(cur, (int, float)) and not isinstance(cur, bool):
-                    prev[k] = max(cur, v)
-                else:
-                    prev[k] = v
+                prev[k] = max(prev.get(k, 0), v)
             elif v is not None:
                 prev[k] = v
         out[c] = prev

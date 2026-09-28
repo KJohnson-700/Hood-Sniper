@@ -377,6 +377,7 @@ class SolMonitor:
                         "mint": r.get("mint"), "symbol": r.get("symbol"),
                         "name": r.get("name"),
                         "progress_pct": r.get("progress_pct"),
+                        "mcap_usd": r.get("mcap_usd"),
                         "n_buys": r.get("n_buys"), "n_buyers": r.get("n_buyers"),
                         "sol_in": round(r.get("sol_in") or 0.0, 4),
                         "virt_sol": r.get("virt_sol"),
