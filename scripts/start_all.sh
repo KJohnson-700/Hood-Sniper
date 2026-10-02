@@ -61,6 +61,10 @@ start "SOL  (stonkfun pairs)" "supervise_stonkfun_pairs.sh" \
 start "GMGN discovery (3 chains)" "supervise_gmgn.sh" \
       bash "$PROJ/scripts/supervise_gmgn.sh"
 
+# --- Discord alert router (per-chain channels) --------------------------------
+start "alert router" "alert_router.py" \
+      bash "$PROJ/scripts/supervise_alerts.sh"
+
 # --- supporting indexes ------------------------------------------------------
 start "smart-money rebuild" "supervise_top_traders.sh" \
       bash "$PROJ/scripts/supervise_top_traders.sh"
