@@ -67,17 +67,31 @@ FRESH_MIN = 12.0                 # only alert on rows observed this recently
 # messages is one you mute, which makes it worse than having none.
 SEED_ON_FIRST_RUN = True
 
-CHANNEL_ENV = {"rhc": "DISCORD_WEBHOOK_URL",
-               "sol": "DISCORD_WEBHOOK_SOL",
-               "bsc": "DISCORD_WEBHOOK_BSC"}
+# Several accepted names per channel, first match wins. The operator named them
+# SOL_/BNB_DISCORD_WEBHOOK_URL, which reads better than my DISCORD_WEBHOOK_SOL, so
+# that form is checked first -- a key that is present but spelled differently from
+# what the code expects is indistinguishable from an unset key, and it reports as
+# "falls back to default" while quietly sending every chain to one channel.
+CHANNEL_ENV = {"rhc": ("DISCORD_WEBHOOK_URL", "HOOD_DISCORD_WEBHOOK_URL"),
+               "sol": ("SOL_DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_SOL"),
+               "bsc": ("BNB_DISCORD_WEBHOOK_URL", "BSC_DISCORD_WEBHOOK_URL",
+                       "DISCORD_WEBHOOK_BSC")}
 COLOR = {"rhc": 0x5865F2, "sol": 0x9945FF, "bsc": 0xF0B90B}
+
+
+def channel_key(channel):
+    """The env name actually holding this channel's webhook, or None."""
+    for name in CHANNEL_ENV.get(channel, ()):
+        if env_key(name):
+            return name
+    return None
 
 
 def hook(channel):
     """Per-channel webhook, falling back to the default so a missing one is a
     degraded path rather than a silent drop."""
-    return env_key(CHANNEL_ENV.get(channel, "DISCORD_WEBHOOK_URL")) or \
-        env_key("DISCORD_WEBHOOK_URL")
+    k = channel_key(channel)
+    return env_key(k) if k else env_key("DISCORD_WEBHOOK_URL")
 
 
 def _tail(name, nbytes=900_000):
@@ -266,8 +280,9 @@ def run(once=False, dry=False, log=print):
         sent.update(seed)
         log(f"  cold start — seeded {len(seed):,} existing tokens as already-seen")
     log(f"  router up — {len(sent):,} already alerted")
-    for ch, env in CHANNEL_ENV.items():
-        log(f"    {ch:4s} -> {env}{'' if env_key(env) else '  (unset, falls back to default)'}")
+    for ch in CHANNEL_ENV:
+        k = channel_key(ch)
+        log(f"    {ch:4s} -> {k if k else 'UNSET, falls back to DISCORD_WEBHOOK_URL'}")
     while True:
         try:
             fresh = [c for c in candidates() if c[1] not in sent]
