@@ -2977,7 +2977,19 @@ data come from the GMGN probe autovet already ran — no extra calls.</p>"""
         threading.Thread(target=self._grad_alert, args=(curve, blk, why),
                          daemon=True).start()
 
+    # GRADUATION ALERTS ARE OFF BY DEFAULT.
+    #
+    # This was the alert the operator was actually receiving, and it is the wrong
+    # moment to be told about: measured on 1,669 post-graduation paths, 93.6% stop
+    # out at 0.70 and every take-profit from 1.15x to 5.0x loses even at ZERO
+    # fees. Being pinged at graduation is being pinged after the trade.
+    #
+    # The runner alert in alert_router.py fires BEFORE this point, on the curve,
+    # which is where the measured edge is. Re-enable with --grad-alerts if you want
+    # the clock-started notice back.
     def _grad_alert(self, curve, blk, why):
+        if not getattr(self.args, "grad_alerts", False):
+            return
         try:
             import alerts
             with self.lock:
@@ -4841,6 +4853,10 @@ def main():
     ap.add_argument("--stake", type=float, default=25.0, help="size used for slippage math")
     ap.add_argument("--max-slip", type=float, default=2.0, help="tradeable threshold %%")
     ap.add_argument("--rows", type=int, default=18)
+    ap.add_argument("--grad-alerts", action="store_true",
+                    help="re-enable Discord alerts on graduation. Off by default: "
+                         "93.6%% of graduated tokens stop out at 0.70 and every "
+                         "take-profit level loses even at zero fees.")
     ap.add_argument("--swell-trades", type=int, default=SWELL_TRADES,
                     help="rolling-window trade count required. 0 disables. "
                          "Default 50 with --swell-buys 0.60 = 4.19x lift at 72%% "

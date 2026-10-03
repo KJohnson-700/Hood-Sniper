@@ -155,6 +155,47 @@ def _fresh(r, cutoff):
     return t is not None and t >= cutoff
 
 
+def vet(r):
+    """
+    (ok, verdict, notes) from what the FEED actually carries.
+
+    The router previously vetted nothing. The full autovet -- honeypot probe, sell
+    simulation, dev history -- lives in the monitor's memory and is never
+    journalled, so a feed reader cannot see it. What IS on every row is three
+    things that were measured, and they are the ones that matter most:
+
+      curve_tradeable   buy() does not revert. False means it is not a live market.
+      curve_sellable    tokens available to sell back. ZERO is the honeypot shape
+                        and was measured on 1.07% of curves.
+      standard_token    bytecode matches the one Pons factory template. A
+                        different code length means it is NOT the standard token,
+                        which is the venue's structural honeypot check.
+
+    UNKNOWN IS NOT PASS. A row missing these fields is reported as UNVETTED and
+    said so in the alert, never rendered as clean -- green on an unvetted token is
+    the most dangerous thing one of these messages can do.
+    """
+    notes = []
+    if r.get("curve_tradeable") is False:
+        return False, "NOT TRADEABLE", ["buy() reverts — not a live market"]
+    if r.get("curve_sellable") == 0:
+        return False, "NO EXIT", ["sellableTokens() is 0 — cannot sell back"]
+    if r.get("standard_token") is False:
+        return False, "NON-STANDARD", ["bytecode is not the Pons template"]
+    have = sum(1 for k in ("curve_tradeable", "curve_sellable", "standard_token")
+               if r.get(k) is not None)
+    flags = r.get("flags") or []
+    killers = [f for f in flags
+               if f == "SOLO-EXEMPT" or f.startswith(("CONCENTRATED", "FLAT-CLIPS",
+                                                      "NONSTD", "INSIDER-SELL"))]
+    if have < 3:
+        notes.append(f"only {have}/3 safety reads available")
+        return True, "UNVETTED", notes + killers
+    if killers:
+        return True, "CAUTION", killers
+    return True, "CLEAR", notes
+
+
 def _gmgn_index():
     """
     address -> GMGN's read of it (smart money, swaps, net buy).
@@ -202,6 +243,9 @@ def candidates(fresh_only=True):
             continue                      # too far up to be worth entering
         good = r.get("good") or []
         flags = r.get("flags") or []
+        ok, verdict, vnotes = vet(r)
+        if not ok:
+            continue                 # a token you cannot exit is not a candidate
         slip = r.get("slippage_pct")
         fee = r.get("total_fee_bps") or 0
         liq = r.get("active_liq_usd")
@@ -209,7 +253,10 @@ def candidates(fresh_only=True):
         bshare = (buyers / (buyers + sellers)) if (buyers + sellers) else None
         # amber whenever a kill flag is present: green on a flagged token is the
         # most dangerous thing this message can do
-        colour = 0xE74C3C if flags else (0x2ECC71 if good else 0xF1C40F)
+        # verdict drives the colour, not the presence of markers: UNVETTED must
+        # never render green
+        colour = {"CLEAR": 0x2ECC71, "CAUTION": 0xF1C40F,
+                  "UNVETTED": 0xF1C40F}.get(verdict, 0xE74C3C)
         fields = [
             {"name": "Exit cost",
              "value": (f"slip **{slip:.2f}%** · fees **{fee/100:.1f}%**\n"
@@ -233,8 +280,12 @@ def candidates(fresh_only=True):
             fields.append({"name": "Good", "value": " · ".join(good[:4]), "inline": False})
         if flags:
             fields.append({"name": "⚠ Flags", "value": " · ".join(flags[:4]), "inline": False})
+        fields.insert(0, {"name": "Vetting",
+                          "value": f"**{verdict}**"
+                                   + (f"\n{'; '.join(vnotes[:2])}" if vnotes else ""),
+                          "inline": True})
         out.append(("rhc", f"rhc:{c}", None,
-                    _embed("rhc", (f"RUNNER · ${r['symbol']}" if r.get("symbol")
+                    _embed("rhc", (f"RUNNER · {verdict} · ${r['symbol']}" if r.get("symbol")
                                    else f"RUNNER · {(r.get('token') or c)[:10]}… (unnamed)"),
                            fields,
                            r.get("token") or c, colour=colour,
