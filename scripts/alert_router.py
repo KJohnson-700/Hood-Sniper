@@ -196,6 +196,77 @@ def vet(r):
     return True, "CLEAR", notes
 
 
+WATCH_FILE = os.path.join(DATA, "dev_watch.json")
+SMART_FEED = os.path.join(DATA, "smart_trades.jsonl")
+SMART_EVERY = 90.0               # GMGN is rate-limited, not credit-limited
+_last_smart = [0.0]
+
+
+def load_watch():
+    try:
+        return json.load(open(WATCH_FILE))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def poll_smart(log=print):
+    """
+    Poll watched SMART wallets for new buys and record them.
+
+    Separate from the dev watch because the moment differs: a dev matters when it
+    CREATES, a smart wallet matters when it BUYS something someone else created.
+
+    Writes to its own feed so a buy is journalled even when the alert fails, and so
+    the picks can be scored later against our own outcome data -- the label "smart"
+    is only ever a hypothesis until that is done. The one wallet on the list was
+    verified first (+77.7% realized, 60.7% win rate over 134 tokens), but a wallet
+    that was good last month is the exact failure that left the RHC trader list 12
+    days stale and silently useless.
+    """
+    if time.time() - _last_smart[0] < SMART_EVERY:
+        return
+    _last_smart[0] = time.time()
+    wallets = list((load_watch().get("smart") or {}).keys())
+    if not wallets:
+        return
+    import investigate as I
+    for w in wallets:
+        d, err = I._gmgn(["portfolio", "activity", "--chain", "sol",
+                          "--wallet", w, "--limit", "20", "--raw"], timeout=90)
+        if err:
+            log(f"  smart poll {w[:8]}… ERROR {err}")
+            continue
+        rs = None
+        def _find(o):
+            if isinstance(o, list) and o and isinstance(o[0], dict):
+                return o
+            if isinstance(o, dict):
+                for v in o.values():
+                    r = _find(v)
+                    if r:
+                        return r
+            return None
+        rs = _find(d) or []
+        with open(SMART_FEED, "a") as f:
+            for r in rs:
+                if str(r.get("event_type") or "").lower() != "buy":
+                    continue
+                f.write(json.dumps({
+                    "ts": r.get("timestamp"), "wallet": w,
+                    # `token` is a NESTED OBJECT, not an address string -- writing
+                    # it raw produced rows whose token read "{'address': '8..." and
+                    # an alert keyed on a stringified dict
+                    "token": ((r.get("token") or {}).get("address")
+                              if isinstance(r.get("token"), dict)
+                              else r.get("token")) or r.get("token_address"),
+                    "symbol": ((r.get("token") or {}).get("symbol")
+                               if isinstance(r.get("token"), dict) else None),
+                    "cost_usd": r.get("cost_usd"),
+                    "launchpad": r.get("launchpad_platform") or r.get("launchpad"),
+                    "tx": r.get("tx_hash"),
+                }) + "\n")
+
+
 def _gmgn_index():
     """
     address -> GMGN's read of it (smart money, swaps, net buy).
@@ -290,6 +361,26 @@ def candidates(fresh_only=True):
                            fields,
                            r.get("token") or c, colour=colour,
                            foot="entry at 10% of supply sold is pf 2.79; 40% is 0.77")))
+
+    # --- SMART WALLET BUYS: high priority -----------------------------------
+    for r in _tail("smart_trades.jsonl", 400_000):
+        tk = r.get("token")
+        if not tk or not _fresh(r, cutoff):
+            continue
+        cost = r.get("cost_usd") or 0
+        fields = [
+            {"name": "Wallet", "value": f"`{str(r.get('wallet'))[:22]}…`", "inline": True},
+            {"name": "Size", "value": f"**${float(cost):,.0f}**", "inline": True},
+            {"name": "Venue", "value": f"**{r.get('launchpad') or '?'}**", "inline": True},
+        ]
+        out.insert(0, ("sol", f"smart:{tk}:{r.get('tx')}", None,
+                       _embed("sol", (f"🧠 SMART WALLET BUY · ${r['symbol']}"
+                                     if r.get("symbol") else
+                                     f"🧠 SMART WALLET BUY · {str(tk)[:10]}…"),
+                              fields, tk, colour=0x00B0F4,
+                              desc="A verified smart wallet just bought this.",
+                              foot="wallet: +77.7% realized, 60.7% win rate over 134 "
+                                   "tokens — but avg hold is 6.1 DAYS, not minutes")))
 
     # --- WATCHED DEV LAUNCHES: highest priority -----------------------------
     # Put first in the list so the per-pass ceiling can never starve it behind 55
@@ -519,6 +610,7 @@ def run(once=False, dry=False, log=print):
         log(f"    {ch:4s} -> {k if k else 'UNSET, falls back to DISCORD_WEBHOOK_URL'}")
     while True:
         try:
+            poll_smart(log=log)
             fresh = [c for c in candidates() if c[1] not in sent]
             # newest-looking first is not knowable here, so cap and let the rest
             # come on the next pass rather than dumping everything at once
