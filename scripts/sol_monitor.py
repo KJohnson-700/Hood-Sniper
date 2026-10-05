@@ -295,7 +295,13 @@ class SolMonitor:
                   f"      dev  {c['dev']}\n", flush=True)
         elif self.args.verbose:
             print(line, flush=True)
-        self._journal(dict(c, kind="create", sig=sig))
+        wdevs, _wf = self.load_watch()
+        dev_hit = (c.get("dev") or "") in wdevs
+        if dev_hit:
+            print(f"\n  *** WATCHED DEV LAUNCH  ${c.get('symbol')}  ***\n"
+                  f"      mint {c.get('mint')}\n      dev  {c.get('dev')}\n",
+                  flush=True)
+        self._journal(dict(c, kind="create", sig=sig, watch_dev=bool(dev_hit)))
 
     def on_trade(self, t):
         m = curve_metrics(t["virt_sol"], t["virt_tokens"])
@@ -425,6 +431,36 @@ class SolMonitor:
             return md.get("symbol") or None
         except Exception:  # noqa: BLE001
             return None
+
+    WATCH_FILE = os.path.join(DATA, "dev_watch.json")
+
+    def load_watch(self):
+        """
+        Watched Solana wallets. Two kinds, because they fire at different moments:
+
+          devs     alert the instant they CREATE a token -- that is the launch
+          funders  alert when they fund a wallet we have never seen, which is a new
+                   dev being spun up BEFORE it launches anything
+
+        The funder is the more useful of the two. The wallet the operator asked
+        about was funded 4x by 5wyKMnJi..., and that funder paid 9 distinct wallets
+        across 40 sampled transactions -- so watching the dev catches one launcher
+        while watching the funder catches the cluster, including devs that do not
+        exist yet.
+
+        Re-read every call so the file can be edited without a restart. Returns
+        empty sets on any failure: an unreadable watchlist must not look like an
+        empty one that silently matches nothing forever, so failures are also
+        surfaced in stats by the caller.
+        """
+        try:
+            d = json.load(open(self.WATCH_FILE))
+            return (set(d.get("devs") or {}), set(d.get("funders") or {}))
+        except FileNotFoundError:
+            return (set(), set())
+        except Exception as ex:  # noqa: BLE001
+            self.stats["watch_err"] = f"{type(ex).__name__}"[:40]
+            return (set(), set())
 
     def snapshot_worker(self, period=20.0):
         """

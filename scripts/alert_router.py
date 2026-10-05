@@ -291,6 +291,28 @@ def candidates(fresh_only=True):
                            r.get("token") or c, colour=colour,
                            foot="entry at 10% of supply sold is pf 2.79; 40% is 0.77")))
 
+    # --- WATCHED DEV LAUNCHES: highest priority -----------------------------
+    # Put first in the list so the per-pass ceiling can never starve it behind 55
+    # ordinary pump.fun rows. A watched launch is the one alert that is worthless
+    # late.
+    for r in _tail("sol_feed.jsonl"):
+        if r.get("kind") != "create" or not r.get("watch_dev"):
+            continue
+        if not _fresh(r, cutoff):
+            continue
+        m = r.get("mint")
+        if not m:
+            continue
+        fields = [
+            {"name": "Dev", "value": f"`{r.get('dev')}`", "inline": False},
+            {"name": "Token", "value": f"**{r.get('name') or '?'}**", "inline": True},
+        ]
+        out.insert(0, ("sol", f"watch:{m}", None,
+                       _embed("sol", f"⭐ WATCHED DEV LAUNCH · ${r.get('symbol') or '?'}",
+                              fields, m, colour=0xFF0000,
+                              desc="A wallet on the watchlist just created a token.",
+                              foot="watchlist: data/dev_watch.json")))
+
     # --- Solana: pump.fun progress + StonkFun rank-on-pair ------------------
     pf = {}
     for r in _tail("sol_feed.jsonl"):
