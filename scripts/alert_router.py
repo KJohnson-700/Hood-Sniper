@@ -267,6 +267,92 @@ def poll_smart(log=print):
                 }) + "\n")
 
 
+FUNDER_STATE = os.path.join(DATA, "funder_seen.json")
+FUNDER_EVERY = 120.0
+_last_funder = [0.0]
+
+
+def poll_funders(log=print):
+    """
+    Alert when a watched FUNDER seeds a wallet we have not seen before.
+
+    This is the only trigger here that fires BEFORE a token exists. A dev wallet
+    alerts at launch; a funder alerts when the next dev is being set up, which is
+    minutes to hours earlier.
+
+    It matters because dev wallets are disposable and the funder is not. The two
+    devs on this list are 10 hours and 0.8 days old; our own RHC data says fresh
+    devs are the BEST bucket (1 launch 11.6% vs 10+ launches 2.8%), which is
+    precisely why operators rotate them -- so watching a dev address catches one
+    launch and then goes dead, while the funder keeps paying. One watched funder
+    holds 35.51 SOL having seeded a single dev so far: ~35 more launches of warning.
+
+    A wallet is only reported ONCE, and the baseline is seeded on first run so
+    existing children do not all fire as discoveries.
+    """
+    if time.time() - _last_funder[0] < FUNDER_EVERY:
+        return
+    _last_funder[0] = time.time()
+    funders = list((load_watch().get("funders") or {}).keys())
+    if not funders:
+        return
+    try:
+        state = json.load(open(FUNDER_STATE))
+    except Exception:  # noqa: BLE001
+        state = {}
+    sys.path.insert(0, HERE)
+    import sol_monitor as S
+    changed = False
+    for f in funders:
+        known = set(state.get(f) or [])
+        sigs = (S.rpc("getSignaturesForAddress", [f, {"limit": 40}]).get("result") or [])
+        found = set()
+        for sg in [x for x in sigs if not x.get("err")][:15]:
+            tx = S.rpc("getTransaction", [sg["signature"],
+                                          {"maxSupportedTransactionVersion": 0,
+                                           "encoding": "jsonParsed"}]).get("result")
+            if not tx:
+                continue
+            msg = tx["transaction"]["message"]
+            keys = [k["pubkey"] if isinstance(k, dict) else k
+                    for k in msg.get("accountKeys", [])]
+            pre, post = tx["meta"]["preBalances"], tx["meta"]["postBalances"]
+            try:
+                i = keys.index(f)
+            except ValueError:
+                continue
+            if (post[i] - pre[i]) / 1e9 >= -0.001:
+                continue                     # funder did not send here
+            for j, k in enumerate(keys):
+                if k == f:
+                    continue
+                amt = (post[j] - pre[j]) / 1e9
+                if amt > 0.01:
+                    found.add(k)
+            time.sleep(0.1)
+        new = found - known
+        if not state.get(f):
+            # FIRST RUN IS A BASELINE, NOT A DISCOVERY. Without this every wallet
+            # the funder has ever paid fires at once.
+            state[f] = sorted(found)
+            changed = True
+            log(f"  funder {f[:8]}… baseline: {len(found)} known children")
+            continue
+        for w in new:
+            with open(os.path.join(DATA, "funder_hits.jsonl"), "a") as fh:
+                fh.write(json.dumps({"ts": time.time(), "funder": f,
+                                     "new_wallet": w}) + "\n")
+            log(f"  *** funder {f[:8]}… seeded NEW wallet {w}")
+        if new:
+            state[f] = sorted(known | found)
+            changed = True
+    if changed:
+        try:
+            json.dump(state, open(FUNDER_STATE, "w"))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _gmgn_index():
     """
     address -> GMGN's read of it (smart money, swaps, net buy).
@@ -361,6 +447,23 @@ def candidates(fresh_only=True):
                            fields,
                            r.get("token") or c, colour=colour,
                            foot="entry at 10% of supply sold is pf 2.79; 40% is 0.77")))
+
+    # --- FUNDER SEEDED A NEW WALLET: earliest possible warning --------------
+    for r in _tail("funder_hits.jsonl", 200_000):
+        w = r.get("new_wallet")
+        if not w or not _fresh(r, cutoff):
+            continue
+        fields = [
+            {"name": "Funder", "value": f"`{str(r.get('funder'))[:22]}…`", "inline": False},
+            {"name": "New wallet", "value": f"`{w}`", "inline": False},
+        ]
+        out.insert(0, ("sol", f"funder:{w}", None,
+                       _embed("sol", "🚨 WATCHED FUNDER SEEDED A NEW WALLET",
+                              fields, w, colour=0xFF0000,
+                              desc="A funder on the watchlist just paid a wallet we "
+                                   "have never seen. This usually precedes a launch.",
+                              foot="fires BEFORE a token exists — dev wallets are "
+                                   "disposable, funders are not")))
 
     # --- SMART WALLET BUYS: high priority -----------------------------------
     for r in _tail("smart_trades.jsonl", 400_000):
@@ -611,6 +714,7 @@ def run(once=False, dry=False, log=print):
     while True:
         try:
             poll_smart(log=log)
+            poll_funders(log=log)
             fresh = [c for c in candidates() if c[1] not in sent]
             # newest-looking first is not knowable here, so cap and let the rest
             # come on the next pass rather than dumping everything at once
