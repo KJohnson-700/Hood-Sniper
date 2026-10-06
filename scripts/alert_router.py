@@ -572,7 +572,13 @@ def candidates(fresh_only=True):
 
     # --- BSC: fresh and already tradeable ----------------------------------
     bs = {}
-    for r in _tail("bsc_feed.jsonl"):
+    # WINDOW MUST MATCH THE METRIC. The gate below judges a launch on GMGN's
+    # swaps_24h, so a token can first become interesting up to 24h after it
+    # launched. The default 900KB tail covered only 6.1h of bsc_feed (measured --
+    # ~2,163 rows at BSC's launch rate), which silently discarded the entire
+    # 6-24h maturity band: the row was gone from the window before the metric
+    # that would have alerted on it could move. 6MB covers ~26h.
+    for r in _tail("bsc_feed.jsonl", 6_000_000):
         if r.get("token"):
             bs[r["token"]] = r
     for t, r in bs.items():
@@ -614,12 +620,22 @@ def candidates(fresh_only=True):
             {"name": "GMGN", "value": f"**★{gsmart}** smart · **{gswaps:,}** swaps/24h",
              "inline": True},
         ]
+        # LIQUIDITY WE MEASURED OURSELVES, from the launch receipt's funded pair.
+        # GMGN's liq field on these rows is unreliable -- it reported 0.0027 for
+        # tokens whose pair held 6.14 BNB on chain -- so ours is the one to show.
+        liq = r.get("liq_quote")
+        if liq is not None:
+            fields.append({"name": "Pool at launch",
+                           "value": f"**{liq:,.2f} {qw}**"
+                                    + (f" ≈ ${liq * 620:,.0f}" if qw == "BNB" else ""),
+                           "inline": True})
         out.append(("bsc", f"bsc:{t}", None,
                     _embed("bsc", f"{r.get('venue') or 'bsc'} · ${r.get('symbol') or '?'}",
                            fields, t, colour=0xF0B90B,
                            desc=(r.get("name") or ""),
-                           foot="only ~17% of four.meme launches are BNB/USDT-quoted — "
-                                "check the quote before sizing")))
+                           foot="quote read from the launch receipt — flap.sh also "
+                                "lists against QQQB (tokenized Nasdaq), which pays "
+                                "the exit in QQQB and is filtered out")))
     return out
 
 

@@ -39,7 +39,7 @@ DATA = os.path.join(os.path.dirname(HERE), "data")
 os.makedirs(DATA, exist_ok=True)
 sys.path.insert(0, HERE)
 from ethsign import keccak256  # noqa: E402
-from bsc_buy import quote_of, quote_label, quote_tradeable  # noqa: E402
+from bsc_buy import quote_of, quote_label, quote_tradeable, USDT  # noqa: E402
 
 RPCS = ["https://bsc-dataseed.bnbchain.org",
         "https://bsc-rpc.publicnode.com",
@@ -85,6 +85,95 @@ T_FOURMEME_LAUNCH = "0x396d5e902b675b032348d3d2e9517ee8f0c4a926603fbc075d3d282ff
 FOURMEME_IMPL = "e506cd33886785816895dbfb2bc8927696c0c8ec"
 FOURMEME_GRAD_CODELEN = 7646
 CLONE_1167 = "363d3d373d3d3d363d73"
+
+# flap.sh QUOTE RESOLUTION.
+# flap.sh is NOT a bonding curve like four.meme -- a launch creates a real
+# WBNB AMM pair and funds it in the SAME transaction. Verified on a live launch
+# (block 126147733, token 0xbac1d9…7777): two PairCreated events, both pairing the
+# new token against WBNB, one empty and one funded with 6.14 WBNB against
+# 1,107,036,368 tokens. So these launches are BNB-quoted and have an exit from
+# block zero -- a BETTER exit path than a four.meme curve, not a worse one.
+#
+# WHY THIS FUNCTION HAD TO EXIST. quote_of() reads four.meme's TokenManager
+# registry, which has no entry for a flap.sh token, so this file previously
+# hardcoded every flapsh launch to (True, "-") -- quote unresolved. The alert
+# router then drops any row whose quote did not resolve, a rule added for a good
+# reason (only the resolved quotes have a proven exit). Two individually correct
+# decisions multiplied to ZERO: all 331,546 flapsh rows ever collected were
+# excluded from Discord, which is why no flap launch has ever been alerted.
+#
+# Topics and selectors are DERIVED, never typed. A hand-written selector has
+# caused three bugs on this project and a wrong one reverts with empty data,
+# which is indistinguishable from a dead contract.
+WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+# flap.sh pairs against REAL WBNB, where four.meme uses a zero-address sentinel for
+# native BNB -- so bsc_buy.TRADEABLE_QUOTES cannot be reused as-is. Same meaning,
+# different encoding. USDT on BSC is 18 decimals, not 6.
+FLAPSH_QUOTES = {WBNB: "BNB", USDT: "USDT"}
+T_PAIR_CREATED = "0x" + keccak256(
+    b"PairCreated(address,address,address,uint256)").hex()
+SEL_GET_RESERVES = "0x" + keccak256(b"getReserves()").hex()[:8]
+
+
+def flapsh_quote(tx, token):
+    """
+    (quote, label, pair, liquidity_in_quote) for a flap.sh launch.
+    Returns (None, None, None, None) when the receipt is unreadable, and
+    (quote, None, pair, liq) when the pair exists but the quote is NOT tradeable.
+
+    MEASURED, NOT ASSUMED. flap.sh is not uniformly BNB-quoted: of 9 consecutive
+    live launches, 5 paired against WBNB, 1 against USDT, and 3 against a third
+    token -- so hardcoding "flapsh means BNB" would have mislabelled 44% of them,
+    including the ones whose exit pays out in an asset you would have to sell
+    again. The quote is whichever side of the pair is not the launch token.
+
+    A launch emits more than one PairCreated and only one is funded, so the pair
+    holding the largest quote reserve wins; an empty pair is not an exit.
+    """
+    if not tx or not token:
+        return None, None, None, None
+    # RECEIPT INDEXING RACE. The launch log reaches us before the node will serve
+    # that transaction's receipt, so the first read returns null for roughly a
+    # third of launches. Measured on 6 consecutive flapsh launches: 2 came back
+    # unresolved and BOTH resolved on a later retry (one with 6.14 BNB of real
+    # liquidity). Without this loop those are written as quote "-" and the alert
+    # router drops them -- the same silent exclusion this whole function exists to
+    # fix, just narrower. Retry only when the receipt is genuinely absent, never
+    # on a receipt that simply has no pair.
+    rc = None
+    for attempt in range(3):
+        rc = rpc("eth_getTransactionReceipt", [tx], tries=1, timeout=6).get("result")
+        if rc:
+            break
+        time.sleep(1.2)
+    if not rc:
+        return None, None, None, None
+    tl = token.lower()
+    best = None
+    for lg in rc.get("logs") or []:
+        tp = lg.get("topics") or []
+        if len(tp) < 3 or tp[0].lower() != T_PAIR_CREATED.lower():
+            continue
+        t0, t1 = ("0x" + tp[1][-40:]).lower(), ("0x" + tp[2][-40:]).lower()
+        if tl not in (t0, t1):
+            continue                      # not this token's pair
+        quote = t1 if t0 == tl else t0
+        pair = "0x" + lg["data"][2:][24:64]
+        r = (rpc("eth_call", [{"to": pair, "data": SEL_GET_RESERVES}, "latest"],
+                 tries=1, timeout=6).get("result"))
+        if not r or len(r) < 194:
+            continue
+        d = r[2:]
+        liq = (int(d[64:128], 16) if t1 == quote else int(d[0:64], 16)) / 1e18
+        # prefer a tradeable quote, then the deepest pool
+        rank = (1 if quote in FLAPSH_QUOTES else 0, liq)
+        if best is None or rank > best[0]:
+            best = (rank, quote, pair, liq)
+    if best is None:
+        return None, None, None, None
+    _, quote, pair, liq = best
+    return quote, FLAPSH_QUOTES.get(quote), pair, round(liq, 4)
+
 
 VENUES = OrderedDict([
     ("four_meme", {"label": "four.meme", "address": FOURMEME_TM,
@@ -177,6 +266,7 @@ def decode_flapsh(log):
               "name": _read_str(d, 7),
               "symbol": _read_str(d, 9),
               "block": int(log["blockNumber"], 16),
+              "tx": log.get("transactionHash"),
               "venue": "flapsh"}
         try:
             ev["ipfs"] = _read_str(d, 11)
@@ -258,6 +348,7 @@ class BscMonitor:
         self.hits = []
         self.devs = {}
         self.skipped_quote = 0
+        self.flapsh_unresolved = 0
         self.n = 0
         self.started = time.time()
         self.lock = threading.Lock()
@@ -289,9 +380,28 @@ class BscMonitor:
         # four.meme curves are quoted in tokenized equities (QQQB, NVDAB, GMEB…),
         # which can only be bought with that asset and pay their exit back in it.
         # Reading it here means an untradeable launch never reaches the alert path.
-        ev["quote"] = quote_of(rpc, ev["token"]) if ev.get("venue") == "four_meme" else None
-        ev["tradeable"], ev["quote_why"] = (
-            quote_tradeable(ev["quote"]) if ev.get("venue") == "four_meme" else (True, "-"))
+        if ev.get("venue") == "four_meme":
+            ev["quote"] = quote_of(rpc, ev["token"])
+            ev["tradeable"], ev["quote_why"] = quote_tradeable(ev["quote"])
+        elif ev.get("venue") == "flapsh":
+            # resolved from the launch receipt's funded pair -- see flapsh_quote
+            q, lab, pair, liq = flapsh_quote(ev.get("tx"), ev.get("token"))
+            ev["quote"], ev["pair"], ev["liq_quote"] = q, pair, liq
+            if lab:
+                ev["tradeable"], ev["quote_why"] = True, lab
+            elif q:
+                # pair exists but pays out in an asset you would have to sell again
+                ev["tradeable"] = False
+                ev["quote_why"] = (f"quoted in {q[:10]}\u2026 \u2014 exit pays out in "
+                                   f"that asset, not in money")
+            else:
+                ev["tradeable"], ev["quote_why"] = True, "-"
+                # UNRESOLVED IS COUNTED. A flaky endpoint would otherwise re-create
+                # the exact silent exclusion this function was written to fix.
+                self.flapsh_unresolved += 1
+        else:
+            ev["quote"] = None
+            ev["tradeable"], ev["quote_why"] = True, "-"
         if self.args.tradeable_only and not ev["tradeable"]:
             self.skipped_quote += 1
             return

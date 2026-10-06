@@ -44,8 +44,15 @@ start "RHC  (pons/bankr/o1)" "launch_monitor.py" \
       bash -c "cd '$PROJ' && exec python3 scripts/launch_monitor.py --no-tui >> logs/rhc.log 2>&1"
 
 # --- BSC: flap.sh + four.meme ------------------------------------------------
+# --all-quotes ON PURPOSE. Without it the collector DROPS every launch whose quote
+# is not BNB/USDT before writing, so the feed contains only the survivors of the
+# very filter you would want to measure -- asking it "what share of launches are
+# BNB-quoted" then returns 100% by construction. It did: 27,064 rows over 7 days,
+# all BNB/USDT, against a 2026-09-08 measurement of ~17% on 300 consecutive
+# launches. Recording everything and letting the ALERT ROUTER filter on quote_why
+# keeps alerting identical and makes the coverage question answerable.
 start "BSC  (flapsh/four.meme)" "bsc_monitor.py" \
-      bash -c "cd '$PROJ' && exec python3 scripts/bsc_monitor.py --verbose >> logs/bsc_collect.log 2>&1"
+      bash -c "cd '$PROJ' && exec python3 -u scripts/bsc_monitor.py --verbose --all-quotes >> logs/bsc_collect.log 2>&1"
 
 # --- Solana: pump.fun + StonkFun on-chain ------------------------------------
 start "SOL  (pump.fun on-chain)" "supervise_sol_monitor.sh" \
