@@ -75,3 +75,58 @@ The RHC base rate was real; applying it to one wallet as a prediction was not.
 The funder trigger (`poll_funders`, commit `7dce5dd`) is unaffected and still worth
 having — it just cannot be justified by the 35-SOL arithmetic I used to justify it.
 Executor remains disarmed. Zero transactions broadcast on any chain.
+
+---
+
+## Follow-up: how much the dev commits per launch
+
+Slim's read was that the +0.8139 looked like creator fees being collected. The token
+balance deltas rule it out — the position zeroes at the exact quantity bought:
+
+```
+10-05 20:02  BUY   0  ->  4,734,567.32 POLLEN   -0.5029 SOL
+10-06 05:43  SELL  4,734,567.32  ->  0          +0.8139 SOL
+```
+
+A fee claim cannot return the precise token count the wallet bought. What made it
+read as a fee claim is that the sell routed through `proVF4pMXVaYqmy4Nj…`, a
+third-party program, rather than pump.fun's own `6EF8rrec…`.
+
+**Dev commitment per launch:**
+
+| launch | create fee | dev buy | outcome |
+|---|---|---|---|
+| POLLEN | 0.0078 SOL | **0.5029 SOL** | sold for 0.8139 (+0.311) |
+| CYBERTRUCK | 0.0078 SOL | **none from this wallet** | still open |
+
+So half the seed on the first token, nothing on the second. n=1 — not a sizing pattern.
+
+## Is there a hidden second wallet doing the buying?
+
+Checked, because deploy-from-A / buy-from-B is the standard pattern and would mean the
+real position size is invisible on the creator. Enumerated every signature on all three
+mints back to the create tx and decoded the first 35 of each launch window.
+
+Two wallets appear in both POLLEN's and CYBERTRUCK's windows. Neither is a dev alt:
+
+- `Gdfyi9hHz7s1aDKbexkGeudLZ4pVjpLpsxECTEmV55Qr` — POLLEN 0.302 + CYBERTRUCK 0.502 SOL.
+  Looked promising until the wallet itself was profiled: **1,000+ signatures in 0.9 days
+  and 41.3 SOL**. That is a sniper bot buying everything, not an operator's buy wallet,
+  and at that rate hitting 2 of 3 tokens is unremarkable.
+- `55mX9tbe…` — 0.012 SOL in each, 443 sigs in 0.8 days. Same story, smaller.
+
+**No evidence of hidden dev buying.** Visible commitment stands at 0.5029 SOL once.
+
+## TRAP 4 — getSignaturesForAddress returns the NEWEST signatures
+
+My first pass at this sorted a 60-signature response ascending and called the result
+"early buyers". It was the most *recent* 60. The tell I initially missed: the dev's own
+0.50 POLLEN buy was absent from a list that claimed to cover POLLEN's launch.
+
+A second pass capped enumeration at 12,000 and still landed 16 minutes after POLLEN's
+create. The real counts are **44,933** signatures for POLLEN and **28,009** for
+CYBERTRUCK, needing 45 and 29 paginated calls to reach genesis.
+
+Check: to study a launch window, paginate with `before` until a page returns fewer rows
+than the limit, then assert the oldest blockTime equals the create tx's. Any cap on that
+loop silently relocates the window forward in time.
