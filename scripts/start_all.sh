@@ -72,6 +72,10 @@ start "GMGN discovery (3 chains)" "supervise_gmgn.sh" \
 start "alert router" "alert_router.py" \
       bash "$PROJ/scripts/supervise_alerts.sh"
 
+# --- GMGN KOL trades: who the named callers are buying -----------------------
+start "KOL tracker (callers)" "supervise_kol.sh" \
+      bash "$PROJ/scripts/supervise_kol.sh"
+
 # --- supporting indexes ------------------------------------------------------
 start "smart-money rebuild" "supervise_top_traders.sh" \
       bash "$PROJ/scripts/supervise_top_traders.sh"
